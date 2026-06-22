@@ -1,0 +1,17 @@
+{$APP_ADDRESS:http://localhost} {
+  log {
+    output stdout
+    format json
+  }
+
+  handle_path /media/* {
+    root * /srv/media
+    header Cache-Control "public, max-age=31536000, immutable"
+    file_server
+  }
+
+  handle {
+    reverse_proxy app:3000
+  }
+}
+

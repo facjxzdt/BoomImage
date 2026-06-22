@@ -1,0 +1,55 @@
+services:
+  app:
+    image: ${BOOMIMAGE_IMAGE:?set BOOMIMAGE_IMAGE in .env, for example ghcr.io/owner/boomimage:latest}
+    environment:
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost}
+      APP_DATA_DIR: /data
+      APP_HOST: 0.0.0.0
+      APP_PORT: 3000
+      APP_SECRET: ${APP_SECRET:-change-me-before-production-use-32-chars}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
+      MAX_INPUT_PIXELS: ${MAX_INPUT_PIXELS:-50000000}
+      TMP_FILE_TTL_SECONDS: ${TMP_FILE_TTL_SECONDS:-86400}
+      TMP_CLEANUP_INTERVAL_SECONDS: ${TMP_CLEANUP_INTERVAL_SECONDS:-3600}
+      IMAGE_WORKERS: ${IMAGE_WORKERS:-2}
+      AVIF_QUALITY: ${AVIF_QUALITY:-50}
+      AVIF_EFFORT: ${AVIF_EFFORT:-4}
+      WEBP_QUALITY: ${WEBP_QUALITY:-82}
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    init: true
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      APP_ADDRESS: ${APP_ADDRESS:-http://localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/originals:/srv/media/originals:ro
+      - ./data/variants:/srv/media/variants:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

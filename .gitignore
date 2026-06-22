@@ -1,0 +1,14 @@
+node_modules/
+.corepack/
+.pnpm-store/
+dist/
+coverage/
+.env
+.DS_Store
+.vscode/
+*.log
+*.tsbuildinfo
+
+# Runtime data
+data/*
+!data/.gitkeep

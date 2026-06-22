@@ -1,0 +1,18 @@
+{
+  "name": "boomimage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A high-performance, single-user image hosting service",
+  "packageManager": "pnpm@10.12.1",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @boomimage/web build && pnpm --filter @boomimage/server build",
+    "backup": "pnpm --filter @boomimage/server backup",
+    "dev": "pnpm --parallel --filter @boomimage/server --filter @boomimage/web dev",
+    "start": "pnpm --filter @boomimage/server start",
+    "test": "pnpm --filter @boomimage/server test",
+    "typecheck": "pnpm --filter @boomimage/web typecheck && pnpm --filter @boomimage/server typecheck"
+  }
+}
