@@ -1,6 +1,6 @@
 # BoomImage
 
-BoomImage 是一个面向单用户、单机部署的高性能图床。它保留原图，并在后台异步生成 AVIF、WebP 和缩略图；普通本地媒体由项目内置 Caddy 在本机端口直出，再交给你自己的 Nginx 对外反代，不经过 Node.js 实时转换。
+BoomImage 是一个面向单用户、单机部署的高性能图床。它保留原图，并在后台异步生成 AVIF、WebP 和缩略图；普通本地媒体由项目内置 Caddy 在本机端口直出，再交给外部 Nginx 对外反代，不经过 Node.js 实时转换。
 
 完整设计参见 PROJECT_PLAN.md，协作约束参见 AGENTS.md。
 
@@ -34,9 +34,9 @@ GitHub Actions 构建镜像 -> GHCR 发布镜像 -> 服务器 docker compose pul
 ghcr.io/facjxzdt/boomimage:latest
 ~~~
 
-你已经将 GHCR package 改为 public 后，服务器无需 docker login ghcr.io 也可以直接拉取镜像。
+GHCR package 已改为 public 后，服务器无需 `docker login ghcr.io` 也可以直接拉取镜像。
 
-如果你只想先照着跑起来，最短路径是：
+如果只需要先完成一次基础部署，最短路径如下：
 
 ~~~bash
 git clone https://github.com/facjxzdt/BoomImage.git
@@ -49,7 +49,7 @@ docker compose up -d
 docker compose ps
 ~~~
 
-其中 `.env` 里必须把 `APP_BASE_URL` 和 `APP_SECRET` 改成自己的值。下面的章节会把每一步展开。
+其中 `.env` 里必须把 `APP_BASE_URL` 和 `APP_SECRET` 改成实际部署值。下面的章节会展开每一步。
 
 ## 1. GitHub 侧准备
 
@@ -72,7 +72,7 @@ ghcr.io/facjxzdt/boomimage:sha-<commit>
 ghcr.io/facjxzdt/boomimage:<branch-or-tag>
 ~~~
 
-你已将 GHCR package 改成 public 后，可以在服务器上直接测试匿名拉取：
+GHCR package 改成 public 后，可以在服务器上直接测试匿名拉取：
 
 ~~~bash
 docker pull ghcr.io/facjxzdt/boomimage:latest
@@ -204,7 +204,7 @@ STORAGE_DRIVER=local
 | S3_FORCE_PATH_STYLE | 是否使用 path-style 访问，MinIO 通常为 `true`。 |
 | S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY | S3 凭证。也兼容 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`。 |
 
-通常不需要修改 `APP_HOST`、`APP_PORT`、`APP_DATA_DIR` 和 `WEB_DIST_DIR`。在 Docker 部署里它们已经和 `compose.yaml` 对齐。默认 `APP_ADDRESS=:80`、`CADDY_HTTP_BIND=127.0.0.1:3001`，表示 Caddy 只作为本机内部网关，由你自己的 Nginx 反代。
+通常不需要修改 `APP_HOST`、`APP_PORT`、`APP_DATA_DIR` 和 `WEB_DIST_DIR`。在 Docker 部署里它们已经和 `compose.yaml` 对齐。默认 `APP_ADDRESS=:80`、`CADDY_HTTP_BIND=127.0.0.1:3001`，表示 Caddy 只作为本机内部网关，由外部 Nginx 反代。
 
 完成首次初始化后，管理界面右上角的“设置”可以修改大部分日常运行参数，并保存到 SQLite 覆盖 `.env` 默认值，包括：
 
@@ -213,7 +213,7 @@ STORAGE_DRIVER=local
 - 默认上传存储后端和 S3 访问方式
 - S3 Endpoint、Region、Bucket、Prefix、CDN 公开基址和访问密钥
 
-注意：S3 的 Bucket、Prefix、Endpoint、Region、Path Style 和公开基址会在每次上传时随图片记录固化。之后你在 UI 或 `.env` 中修改这些位置相关配置，只会影响新上传；旧图片、旧变体、S3 proxy 和删除任务会继续使用它们创建时的对象定位快照。S3 访问密钥不会随图片保存，私有 bucket 仍要求当前配置的凭证有权限访问旧 bucket。
+注意：S3 的 Bucket、Prefix、Endpoint、Region、Path Style 和公开基址会在每次上传时随图片记录固化。之后在 UI 或 `.env` 中修改这些位置相关配置，只会影响新上传；旧图片、旧变体、S3 proxy 和删除任务会继续使用它们创建时的对象定位快照。S3 访问密钥不会随图片保存，私有 bucket 仍要求当前配置的凭证有权限访问旧 bucket。
 
 `.env` 仍建议只管理启动级或底座配置，例如 `BOOMIMAGE_IMAGE`、`APP_BASE_URL`、`APP_SECRET`、`APP_HOST`、`APP_PORT`、`APP_DATA_DIR`、`WEB_DIST_DIR` 和 `CADDY_HTTP_BIND`。如果在 UI 中调大上传上限，也要同步调大 Nginx 的 `client_max_body_size` 或其他前置代理限制。
 
@@ -229,13 +229,13 @@ openssl rand -base64 48
 APP_BASE_URL=http://localhost
 ~~~
 
-正式上线前，请确保 DNS 已经解析到服务器，并且你的 Nginx 已监听公网 80/443。项目内置 Caddy 默认只监听宿主机 `127.0.0.1:3001`，不负责公网 HTTPS 证书。
+正式上线前，应确保 DNS 已经解析到服务器，并且前置 Nginx 已监听公网 80/443。项目内置 Caddy 默认只监听宿主机 `127.0.0.1:3001`，不负责公网 HTTPS 证书。
 
-如果使用 Cloudflare，建议先关闭橙色云代理或使用“完全/严格”TLS 模式，等源站证书签发成功后再按你的网络策略开启代理。
+如果使用 Cloudflare，建议先关闭橙色云代理或使用“完全/严格”TLS 模式，等源站证书签发成功后再按实际网络策略开启代理。
 
 ### 可选：启用 S3 兼容存储
 
-BoomImage 默认继续使用本地磁盘。你也可以配置 S3 兼容对象存储，并在上传时选择“本地”或“S3”。
+BoomImage 默认继续使用本地磁盘。也可以配置 S3 兼容对象存储，并在上传时选择“本地”或“S3”。
 
 S3 有两种访问方式：
 
@@ -259,7 +259,7 @@ S3_SECRET_ACCESS_KEY=your-secret-key
 
 如果希望默认上传到 S3，把 `STORAGE_DRIVER=s3`。如果只是偶尔上传到 S3，保持 `STORAGE_DRIVER=local`，在管理界面上传前选择 S3 即可。
 
-S3 配置的一个重要行为是“按上传固化”：图片写入 S3 时，BoomImage 会把实际 bucket、object key、Endpoint、Region、公开基址和 path-style 设置保存到 SQLite。这样以后你调整默认 `S3_PREFIX` 或换 CDN 域名时，旧图片仍会按创建时的位置生成直链、代理读取和删除清理。这里不保存访问密钥；如果旧 bucket 是私有的，切换账号或密钥前必须确认新凭证仍有旧 bucket 的 `GetObject` / `DeleteObject` 权限。要把旧对象迁移到新 bucket，需要先用对象存储工具复制对象，再规划数据库记录迁移，不要依赖启动时自动回填。
+S3 配置的一个重要行为是“按上传固化”：图片写入 S3 时，BoomImage 会把实际 bucket、object key、Endpoint、Region、公开基址和 path-style 设置保存到 SQLite。这样以后调整默认 `S3_PREFIX` 或换 CDN 域名时，旧图片仍会按创建时的位置生成直链、代理读取和删除清理。这里不保存访问密钥；如果旧 bucket 是私有的，切换账号或密钥前必须确认新凭证仍有旧 bucket 的 `GetObject` / `DeleteObject` 权限。要把旧对象迁移到新 bucket，需要先用对象存储工具复制对象，再规划数据库记录迁移，不要依赖启动时自动回填。
 
 ## 5. 启动服务
 
@@ -330,7 +330,7 @@ docker compose logs --tail=200 app
 
 ## 6. 使用 Nginx 反代项目内置 Caddy
 
-默认 Compose 会启动 `app` 和 `caddy` 两个容器，但 Caddy 不直接暴露公网 80/443，而是只绑定宿主机回环地址 `127.0.0.1:3001`。你的 Nginx 负责公网 HTTPS，再反代到这个本机端口：
+默认 Compose 会启动 `app` 和 `caddy` 两个容器，但 Caddy 不直接暴露公网 80/443，而是只绑定宿主机回环地址 `127.0.0.1:3001`。前置 Nginx 负责公网 HTTPS，再反代到这个本机端口：
 
 ~~~text
 公网用户 -> Nginx HTTPS -> 127.0.0.1:3001 -> Caddy -> app / 本地媒体文件
@@ -401,7 +401,7 @@ server {
 
 - `client_max_body_size` 应不小于 `.env` 中的 `MAX_UPLOAD_BYTES`。默认 50 MB 时写 `50m` 即可。
 - `/api/v1/images` 建议关闭 `proxy_request_buffering`，减少上传大图时 Nginx 的临时文件缓冲。
-- 不要把 `CADDY_HTTP_BIND` 改成 `0.0.0.0:3001`，除非你明确希望绕过 Nginx 直接访问 Caddy。
+- 不建议把 `CADDY_HTTP_BIND` 改成 `0.0.0.0:3001`，除非部署方明确希望绕过 Nginx 直接访问 Caddy。
 - 如果启用 S3 proxy，`/media/proxy/*` 不要改写到本地静态目录，它必须经过 BoomImage 应用鉴别数据库路径后再代理 S3 对象。
 
 配置后验证：
@@ -744,7 +744,7 @@ docker compose logs -f app
 检查：
 
 - `S3_BUCKET` 是否填写。
-- `S3_ENDPOINT`、`S3_REGION` 和 `S3_FORCE_PATH_STYLE` 是否符合你的 S3 兼容服务。
+- `S3_ENDPOINT`、`S3_REGION` 和 `S3_FORCE_PATH_STYLE` 是否符合当前 S3 兼容服务。
 - `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` 是否有 `PutObject`、`GetObject`、`DeleteObject` 权限。
 - `S3_PREFIX` 不要以 `/` 开头或结尾；程序会自动规范化。
 
@@ -789,7 +789,7 @@ sudo ss -lntp | grep ':3001'
 - DNS 已解析到服务器公网 IP。
 - 云厂商安全组和系统防火墙已开放 Nginx 使用的 80/443。
 - `docker compose ps` 中 app 和 caddy 均为正常状态。
-- `https://你的域名/health/ready` 返回 `{"status":"ready"}`。
+- `https://部署域名/health/ready` 返回 `{"status":"ready"}`。
 - 已完成首次管理员初始化，并把密码保存到密码管理器。
 - 已上传一张测试图片，确认 `/media/...` 链接可访问。
 - 如果启用 S3，已分别测试 S3 直链或 `/media/proxy/...` 代理链接。
