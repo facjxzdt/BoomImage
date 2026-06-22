@@ -8,7 +8,7 @@ BoomImage 是一个面向单用户的高性能图床，目标是：
 
 - 单机 Docker Compose 一键部署。
 - 保留原图，并异步生成 AVIF、WebP 和缩略图。
-- 本地媒体读取由 Caddy 直接提供；S3 媒体可选择对象存储/CDN 直链或 BoomImage 服务器代理。
+- 本地媒体读取由项目内置 Caddy 提供，生产环境由用户自己的 Nginx 反代到 Caddy 的本机端口；S3 媒体可选择对象存储/CDN 直链或 BoomImage 服务器代理。
 - 默认使用本地文件系统和 SQLite，保持部署及备份简单；可按上传选择 S3 兼容对象存储。
 
 详细架构、数据模型、API 草案和里程碑以 `PROJECT_PLAN.md` 为准。
@@ -20,7 +20,7 @@ BoomImage 是一个面向单用户的高性能图床，目标是：
 - Sharp/libvips 图片处理。
 - SQLite WAL 模式。
 - React + Vite + Tailwind CSS 管理界面。
-- Caddy 静态媒体服务和 HTTPS。
+- Caddy 内部静态媒体网关；公网 HTTPS 由外部 Nginx 提供。
 - 可选 S3 兼容对象存储。
 - Docker Compose 部署。
 
@@ -43,7 +43,7 @@ BoomImage 是一个面向单用户的高性能图床，目标是：
 - 转换任务必须持久化、幂等、可重试，并能在进程重启后恢复。
 - 转换并发必须受控，不能为每个上传无限创建线程或任务。
 - 公开媒体使用内容哈希路径和不可变缓存。
-- 本地普通媒体读取应由 Caddy 完成，不经过 Fastify 或 Sharp；S3 直链由对象存储/CDN 提供，S3 proxy 只允许代理数据库中存在且未删除的媒体路径。
+- 本地普通媒体读取应由 Caddy 完成，不经过 Fastify 或 Sharp；生产公网入口由外部 Nginx 反代到 Caddy；S3 直链由对象存储/CDN 提供，S3 proxy 只允许代理数据库中存在且未删除的媒体路径。
 - 文件路径必须由服务端生成，不能直接拼接用户提供的文件名。
 
 ## 安全约束

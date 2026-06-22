@@ -1,6 +1,6 @@
 # BoomImage
 
-BoomImage 是一个面向单用户、单机部署的高性能图床。它保留原图，并在后台异步生成 AVIF、WebP 和缩略图；普通媒体读取由 Caddy 直接提供，不经过 Node.js 实时转换。
+BoomImage 是一个面向单用户、单机部署的高性能图床。它保留原图，并在后台异步生成 AVIF、WebP 和缩略图；普通本地媒体由项目内置 Caddy 在本机端口直出，再交给你自己的 Nginx 对外反代，不经过 Node.js 实时转换。
 
 完整设计参见 PROJECT_PLAN.md，协作约束参见 AGENTS.md。
 
@@ -49,7 +49,7 @@ docker compose up -d
 docker compose ps
 ~~~
 
-其中 `.env` 里必须把 `APP_ADDRESS`、`APP_BASE_URL` 和 `APP_SECRET` 改成自己的值。下面的章节会把每一步展开。
+其中 `.env` 里必须把 `APP_BASE_URL` 和 `APP_SECRET` 改成自己的值。下面的章节会把每一步展开。
 
 ## 1. GitHub 侧准备
 
@@ -104,8 +104,8 @@ BOOMIMAGE_IMAGE=ghcr.io/facjxzdt/boomimage:v0.1.0
 - 磁盘容量按图片规模预留，重点关注 data 目录占用。
 - 已安装 Docker Engine 和 Docker Compose v2。
 - 域名已解析到服务器公网 IP。
-- 服务器防火墙开放 80 和 443。
-- 如果服务器上已有 Nginx、宝塔、1Panel 等占用 80/443，需要先决定由谁对外提供 HTTPS，避免端口冲突。
+- 服务器上已有或准备安装 Nginx，并由 Nginx 对公网监听 80 和 443。
+- BoomImage 自带 Caddy 默认只绑定宿主机 `127.0.0.1:3001`，不需要向公网开放 3001。
 
 检查 Docker：
 
@@ -161,9 +161,9 @@ nano .env
 
 ~~~env
 BOOMIMAGE_IMAGE=ghcr.io/facjxzdt/boomimage:latest
-APP_ADDRESS=https://img.example.com
 APP_BASE_URL=https://img.example.com
 APP_SECRET=replace-with-a-real-random-secret
+CADDY_HTTP_BIND=127.0.0.1:3001
 LOG_LEVEL=info
 MAX_UPLOAD_BYTES=52428800
 MAX_INPUT_PIXELS=50000000
@@ -179,7 +179,6 @@ STORAGE_DRIVER=local
 | 变量 | 说明 |
 | --- | --- |
 | BOOMIMAGE_IMAGE | 要拉取的 GHCR 镜像。生产建议用固定 tag。 |
-| APP_ADDRESS | Caddy 对外站点地址。正式域名用 https://img.example.com。 |
 | APP_BASE_URL | API 返回图片链接时使用的公开地址，必须和访问域名一致。 |
 | APP_SECRET | 会话 Cookie 签名密钥，必须是随机长字符串；生产环境缺失、模板值或明显占位值会拒绝启动。 |
 | MAX_UPLOAD_BYTES | 单文件上传大小上限，默认 50 MB。 |
@@ -205,7 +204,7 @@ STORAGE_DRIVER=local
 | S3_FORCE_PATH_STYLE | 是否使用 path-style 访问，MinIO 通常为 `true`。 |
 | S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY | S3 凭证。也兼容 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`。 |
 
-通常不需要修改 `APP_HOST`、`APP_PORT`、`APP_DATA_DIR` 和 `WEB_DIST_DIR`。在 Docker 部署里它们已经和 `compose.yaml` 对齐。
+通常不需要修改 `APP_HOST`、`APP_PORT`、`APP_DATA_DIR` 和 `WEB_DIST_DIR`。在 Docker 部署里它们已经和 `compose.yaml` 对齐。默认 `APP_ADDRESS=:80`、`CADDY_HTTP_BIND=127.0.0.1:3001`，表示 Caddy 只作为本机内部网关，由你自己的 Nginx 反代。
 
 完成首次初始化后，管理界面右上角的“设置”可以修改大部分日常运行参数，并保存到 SQLite 覆盖 `.env` 默认值，包括：
 
@@ -216,7 +215,7 @@ STORAGE_DRIVER=local
 
 注意：S3 的 Bucket、Prefix、Endpoint、Region、Path Style 和公开基址会在每次上传时随图片记录固化。之后你在 UI 或 `.env` 中修改这些位置相关配置，只会影响新上传；旧图片、旧变体、S3 proxy 和删除任务会继续使用它们创建时的对象定位快照。S3 访问密钥不会随图片保存，私有 bucket 仍要求当前配置的凭证有权限访问旧 bucket。
 
-`.env` 仍建议只管理启动级或底座配置，例如 `BOOMIMAGE_IMAGE`、`APP_ADDRESS`、`APP_SECRET`、`APP_HOST`、`APP_PORT`、`APP_DATA_DIR`、`WEB_DIST_DIR`。如果在 UI 中调大上传上限，也要同步调大 Nginx 的 `client_max_body_size` 或其他前置代理限制。
+`.env` 仍建议只管理启动级或底座配置，例如 `BOOMIMAGE_IMAGE`、`APP_BASE_URL`、`APP_SECRET`、`APP_HOST`、`APP_PORT`、`APP_DATA_DIR`、`WEB_DIST_DIR` 和 `CADDY_HTTP_BIND`。如果在 UI 中调大上传上限，也要同步调大 Nginx 的 `client_max_body_size` 或其他前置代理限制。
 
 生成 APP_SECRET：
 
@@ -227,11 +226,10 @@ openssl rand -base64 48
 如果还没有域名，只想本机测试，可以临时使用：
 
 ~~~env
-APP_ADDRESS=http://localhost
 APP_BASE_URL=http://localhost
 ~~~
 
-正式上线前，请确保 DNS 已经解析到服务器，并且 80/443 端口可访问。Caddy 会自动申请和续期 HTTPS 证书。
+正式上线前，请确保 DNS 已经解析到服务器，并且你的 Nginx 已监听公网 80/443。项目内置 Caddy 默认只监听宿主机 `127.0.0.1:3001`，不负责公网 HTTPS 证书。
 
 如果使用 Cloudflare，建议先关闭橙色云代理或使用“完全/严格”TLS 模式，等源站证书签发成功后再按你的网络策略开启代理。
 
@@ -330,12 +328,12 @@ curl https://img.example.com/health/ready
 docker compose logs --tail=200 app
 ~~~
 
-## 6. 使用 Nginx 作为前置反向代理
+## 6. 使用 Nginx 反代项目内置 Caddy
 
-如果服务器上已经有 Nginx、宝塔或 1Panel，推荐让 Nginx 对公网监听 80/443，再把请求转发给 BoomImage 自带的 Caddy。这个结构是：
+默认 Compose 会启动 `app` 和 `caddy` 两个容器，但 Caddy 不直接暴露公网 80/443，而是只绑定宿主机回环地址 `127.0.0.1:3001`。你的 Nginx 负责公网 HTTPS，再反代到这个本机端口：
 
 ~~~text
-公网用户 -> Nginx HTTPS -> 127.0.0.1:8080 -> Caddy -> app / 本地媒体文件
+公网用户 -> Nginx HTTPS -> 127.0.0.1:3001 -> Caddy -> app / 本地媒体文件
 ~~~
 
 这样做的好处是：Nginx 继续统一管理证书和站点入口，BoomImage 仍然可以通过 Caddy 高效直出本地 `/media/originals/*` 和 `/media/variants/*`，S3 proxy 的 `/media/proxy/*` 也会正确转发到应用。
@@ -345,12 +343,10 @@ docker compose logs --tail=200 app
 ~~~env
 APP_ADDRESS=:80
 APP_BASE_URL=https://img.example.com
-CADDY_HTTP_BIND=127.0.0.1:8080
-CADDY_HTTPS_BIND=127.0.0.1:8443
-CADDY_HTTPS_UDP_BIND=127.0.0.1:8443
+CADDY_HTTP_BIND=127.0.0.1:3001
 ~~~
 
-其中 `APP_BASE_URL` 必须是用户最终访问的 HTTPS 域名。`APP_ADDRESS=:80` 表示 Caddy 在容器内只按 HTTP 站点工作，不负责公网证书。
+其中 `APP_BASE_URL` 必须是用户最终访问的 HTTPS 域名。`APP_ADDRESS=:80` 表示 Caddy 在容器内只按 HTTP 站点工作，不负责公网证书；`CADDY_HTTP_BIND=127.0.0.1:3001` 表示宿主机只有本机进程可以访问 Caddy。
 
 然后重启 BoomImage：
 
@@ -379,7 +375,7 @@ server {
     proxy_send_timeout 300s;
 
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:3001;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -389,7 +385,7 @@ server {
     }
 
     location /api/v1/images {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:3001;
         proxy_http_version 1.1;
         proxy_request_buffering off;
         proxy_set_header Host $host;
@@ -405,7 +401,7 @@ server {
 
 - `client_max_body_size` 应不小于 `.env` 中的 `MAX_UPLOAD_BYTES`。默认 50 MB 时写 `50m` 即可。
 - `/api/v1/images` 建议关闭 `proxy_request_buffering`，减少上传大图时 Nginx 的临时文件缓冲。
-- 不要让 Nginx 和 Caddy 同时抢占公网 80/443；使用上面的回环绑定后，Caddy 只监听 `127.0.0.1:8080`。
+- 不要把 `CADDY_HTTP_BIND` 改成 `0.0.0.0:3001`，除非你明确希望绕过 Nginx 直接访问 Caddy。
 - 如果启用 S3 proxy，`/media/proxy/*` 不要改写到本地静态目录，它必须经过 BoomImage 应用鉴别数据库路径后再代理 S3 对象。
 
 配置后验证：
@@ -686,18 +682,20 @@ docker login ghcr.io
 
 用户名填 GitHub 用户名，密码使用具有 read:packages 权限的 Personal Access Token。
 
-### Caddy 无法申请 HTTPS 证书
+### Nginx 反代后无法访问
 
 检查：
 
 - 域名 A/AAAA 记录是否指向服务器。
-- 服务器 80 和 443 是否开放。
-- APP_ADDRESS 是否是正式域名，例如 https://img.example.com。
-- 云厂商安全组是否放行 80/443。
+- Nginx 是否正在监听公网 80 和 443。
+- Nginx 的 `proxy_pass` 是否指向 `http://127.0.0.1:3001`。
+- `.env` 中 `CADDY_HTTP_BIND` 是否仍为 `127.0.0.1:3001`。
+- `.env` 中 `APP_BASE_URL` 是否是最终公开 HTTPS 域名。
 
-查看 Caddy 日志：
+查看日志：
 
 ~~~bash
+docker compose logs -f app
 docker compose logs -f caddy
 ~~~
 
@@ -738,6 +736,7 @@ docker compose logs -f app
 - 图片是否转换完成。
 - data/originals 和 data/variants 是否存在。
 - Caddy volume 是否正确挂载。
+- Nginx 是否完整保留 `/media/...` 路径并反代到 `127.0.0.1:3001`。
 - URL 中 hash 路径是否完整。
 
 ### S3 上传失败
@@ -761,15 +760,15 @@ docker compose logs -f app
 
 代理模式下图片流量会经过 BoomImage 服务器，速度取决于服务器到 S3 的链路和服务器出口带宽。公开图床更推荐 `direct` 加 CDN。
 
-### docker compose up 提示端口被占用
+### docker compose up 提示 3001 端口被占用
 
-说明服务器已有程序监听 80 或 443。排查：
+说明宿主机已有程序监听 `127.0.0.1:3001`。排查：
 
 ~~~bash
-sudo ss -lntp | grep -E ':80|:443'
+sudo ss -lntp | grep ':3001'
 ~~~
 
-如果已有反向代理，可以选择停掉旧服务，或者改为由旧反向代理转发到 BoomImage；后一种方式需要同步调整 `compose.yaml` 和 `deploy/Caddyfile`，不要让两个服务同时抢 80/443。
+可以停掉占用端口的旧服务，或者在 `.env` 中把 `CADDY_HTTP_BIND` 改成另一个本机端口，例如 `127.0.0.1:3011`，同时同步修改 Nginx 的 `proxy_pass`。
 
 ### 登录后接口提示 CSRF 或 Cookie 问题
 
@@ -786,9 +785,9 @@ sudo ss -lntp | grep -E ':80|:443'
 
 - GHCR package 已经是 public，服务器可以匿名 `docker pull ghcr.io/facjxzdt/boomimage:latest`。
 - `.env` 已设置真实 `APP_SECRET`，不是模板默认值；生产环境缺失或使用占位值会拒绝启动。
-- `APP_ADDRESS` 和 `APP_BASE_URL` 都是最终访问域名。
+- `APP_BASE_URL` 是最终访问域名，`APP_ADDRESS=:80`，`CADDY_HTTP_BIND=127.0.0.1:3001`。
 - DNS 已解析到服务器公网 IP。
-- 云厂商安全组和系统防火墙已开放 80/443。
+- 云厂商安全组和系统防火墙已开放 Nginx 使用的 80/443。
 - `docker compose ps` 中 app 和 caddy 均为正常状态。
 - `https://你的域名/health/ready` 返回 `{"status":"ready"}`。
 - 已完成首次管理员初始化，并把密码保存到密码管理器。

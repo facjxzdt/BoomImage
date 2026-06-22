@@ -57,7 +57,7 @@
 | 数据库 | SQLite（WAL） | 保存元数据和持久化任务队列 |
 | 文件存储 | 本地文件系统 + 可选 S3 兼容存储 | 图片二进制不存入 SQLite，可按上传选择后端 |
 | 管理界面 | React + Vite + Tailwind CSS | 构建后作为静态资源发布 |
-| 网关 | Caddy | HTTPS、API 反向代理、媒体文件静态服务 |
+| 网关 | Nginx + Caddy | 公网 HTTPS 由用户自有 Nginx 提供；项目 Caddy 仅作为本机 3001 端口的应用/媒体网关 |
 | 部署 | Docker Compose | `app + caddy` 两个容器 |
 | 测试 | Vitest + Fastify inject | 单元测试和 API 集成测试 |
 
@@ -73,7 +73,9 @@
 ```text
 浏览器 / API 客户端 / PicGo
              │
-        Caddy / Nginx
+    Nginx（公网 HTTPS）
+             │
+ Caddy（127.0.0.1:3001）
       ┌──────┴─────────┐
       │                │
  /api、管理页面     /media/*
@@ -91,7 +93,7 @@
 1. 上传路径和读取路径分离。
 2. 上传流式落盘，不把整个文件保存在应用内存中。
 3. 转换异步执行，任务状态持久化到 SQLite。
-4. 本地媒体由 Caddy/Nginx 直接读取；S3 媒体可返回对象存储/CDN 直链，或通过 BoomImage 代理读取。
+4. 本地媒体由项目 Caddy 从只读挂载目录直接读取，公网入口由用户自有 Nginx 反代到 Caddy；S3 媒体可返回对象存储/CDN 直链，或通过 BoomImage 代理读取。
 5. 文件和 S3 object key 采用内容哈希寻址，并设置长期不可变缓存。
 
 ## 5. 建议仓库结构
@@ -106,7 +108,6 @@ BoomImage/
 ├─ migrations/             # SQLite 数据库迁移
 ├─ deploy/
 │  ├─ Caddyfile
-│  └─ entrypoint.sh
 ├─ data/                    # 本地开发数据，不提交 Git
 ├─ Dockerfile
 ├─ compose.yaml
@@ -138,7 +139,7 @@ data/
 
 - `ab/cd` 取 SHA-256 前四位，用于避免单目录文件过多。
 - 临时文件与最终文件必须处于同一文件系统，以支持原子重命名。
-- Caddy 只读挂载 `originals` 和 `variants`。
+- Caddy 只读挂载 `originals` 和 `variants`，默认只暴露到宿主机 `127.0.0.1:3001`，由用户自有 Nginx 负责公网入口和 TLS。
 - 数据库只存路径和元数据，不存图片 BLOB。
 - S3 模式下数据库保存对象 key、bucket、Endpoint、Region、公开基址、path-style、存储后端和访问模式；对象 key 仍由服务端根据内容哈希生成，并在上传时固化到图片和变体记录，避免后续修改默认 S3 位置配置导致旧对象定位漂移。数据库不保存访问密钥，S3 proxy、Worker 读取和删除清理使用当前凭证，因此更换账号或密钥前必须确认新凭证仍可访问旧 bucket。
 
@@ -347,10 +348,11 @@ Cache-Control: public, max-age=31536000, immutable
 
 ### caddy
 
-- 对外暴露 `80/443`。
-- `/api/*` 和管理页面反向代理至 app。
-- `/media/*` 从只读目录直接提供。
-- 保存 Caddy 证书数据卷。
+- 默认只绑定宿主机回环地址 `127.0.0.1:3001`，不直接暴露公网 `80/443`。
+- 公网 HTTPS、证书、HTTP 到 HTTPS 跳转由用户自有 Nginx 负责，Nginx 反代到 `http://127.0.0.1:3001`。
+- `/api/*`、管理页面和 `/media/proxy/*` 反向代理至 app。
+- `/media/originals/*` 和 `/media/variants/*` 从只读目录直接提供。
+- Caddy 证书数据卷保留但默认不用于公网证书。
 - 对内容哈希文件设置长期缓存头。
 
 ### 环境变量草案
@@ -358,6 +360,8 @@ Cache-Control: public, max-age=31536000, immutable
 ```text
 APP_BASE_URL=https://img.example.com
 BOOMIMAGE_IMAGE=ghcr.io/owner/boomimage:latest
+APP_ADDRESS=:80
+CADDY_HTTP_BIND=127.0.0.1:3001
 APP_DATA_DIR=/data
 APP_SECRET=<随机长密钥>
 ADMIN_PASSWORD=<首次启动密码>

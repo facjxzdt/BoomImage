@@ -54,11 +54,9 @@ services:
   caddy:
     image: caddy:2-alpine
     environment:
-      APP_ADDRESS: ${APP_ADDRESS:-http://localhost}
+      APP_ADDRESS: ${APP_ADDRESS:-:80}
     ports:
-      - "${CADDY_HTTP_BIND:-80}:80"
-      - "${CADDY_HTTPS_BIND:-443}:443"
-      - "${CADDY_HTTPS_UDP_BIND:-443}:443/udp"
+      - "${CADDY_HTTP_BIND:-127.0.0.1:3001}:80"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./data/originals:/srv/media/originals:ro
