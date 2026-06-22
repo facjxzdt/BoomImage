@@ -1,6 +1,6 @@
 services:
   app:
-    image: ${BOOMIMAGE_IMAGE:?set BOOMIMAGE_IMAGE in .env, for example ghcr.io/owner/boomimage:latest}
+    image: ${BOOMIMAGE_IMAGE:?set BOOMIMAGE_IMAGE in .env, for example ghcr.io/facjxzdt/boomimage:latest}
     environment:
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost}
       APP_DATA_DIR: /data
