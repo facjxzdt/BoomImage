@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -25,6 +25,19 @@ async function httpsTestConfig() {
   const config = await testConfig();
   config.baseUrl = "https://img.example.test";
   return config;
+}
+
+async function webDistFixture(): Promise<string> {
+  const webDistDir = await mkdtemp(join(tmpdir(), "boomimage-web-dist-test-"));
+  cleanupDirectories.push(webDistDir);
+  await mkdir(join(webDistDir, "assets"));
+  await writeFile(
+    join(webDistDir, "index.html"),
+    '<!doctype html><html><head><title>BoomImage</title><link rel="stylesheet" href="/assets/index.css"></head><body>BoomImage</body></html>',
+    "utf8",
+  );
+  await writeFile(join(webDistDir, "assets", "index.css"), ":root { --surface: #ffffff; }", "utf8");
+  return webDistDir;
 }
 
 describe("BoomImage application", () => {
@@ -68,7 +81,7 @@ describe("BoomImage application", () => {
 
   it("serves the built management interface when a web distribution exists", async () => {
     const config = await testConfig();
-    config.webDistDir = resolve(process.cwd(), "../web/dist");
+    config.webDistDir = await webDistFixture();
     const app = await buildApp({ config, logger: false, startWorkers: false });
     const response = await app.inject({ method: "GET", url: "/" });
 
@@ -80,7 +93,7 @@ describe("BoomImage application", () => {
 
   it("serves built management interface assets", async () => {
     const config = await testConfig();
-    config.webDistDir = resolve(process.cwd(), "../web/dist");
+    config.webDistDir = await webDistFixture();
     const app = await buildApp({ config, logger: false, startWorkers: false });
     const index = await app.inject({ method: "GET", url: "/" });
     const assetPath = index.body.match(/href="([^"]+\.css)"/)?.[1];
