@@ -108,6 +108,7 @@ function setSessionCookies(
     secure: config.baseUrl.startsWith("https://"),
     sameSite: "strict",
     maxAge: config.sessionTtlSeconds,
+    signed: true,
   });
   reply.setCookie("boomimage_csrf", csrfToken, {
     path: "/",
@@ -124,6 +125,7 @@ function clearSessionCookie(reply: FastifyReply, config: AppConfig): void {
     httpOnly: true,
     secure: config.baseUrl.startsWith("https://"),
     sameSite: "strict",
+    signed: true,
   });
   reply.clearCookie("boomimage_csrf", {
     path: "/",
@@ -186,8 +188,11 @@ export function authenticateRequest(
     return { kind: "api-token", credentialHash: tokenHash };
   }
 
-  const token = request.cookies[SESSION_COOKIE];
-  if (!token) return undefined;
+  const signedToken = request.cookies[SESSION_COOKIE];
+  if (!signedToken) return undefined;
+  const unsignedToken = request.unsignCookie(signedToken);
+  if (!unsignedToken.valid) return undefined;
+  const token = unsignedToken.value;
 
   const tokenHash = digest(token);
   const session = database
@@ -332,7 +337,12 @@ export function registerAuthRoutes(
     { preHandler: requireAuthentication(database, { csrf: true, allowApiToken: false }) },
     async (request, reply) => {
       const token = request.cookies[SESSION_COOKIE];
-      if (token) database.prepare("DELETE FROM sessions WHERE token_hash = ?").run(digest(token));
+      if (token) {
+        const unsignedToken = request.unsignCookie(token);
+        if (unsignedToken.valid) {
+          database.prepare("DELETE FROM sessions WHERE token_hash = ?").run(digest(unsignedToken.value));
+        }
+      }
       clearSessionCookie(reply, config);
       return reply.code(204).send();
     },

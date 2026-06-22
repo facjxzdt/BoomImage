@@ -12,6 +12,7 @@ import {
   cleanupTemporaryFiles,
   prepareDataDirectories,
 } from "./filesystem.js";
+import { assertImageFormatsReady } from "./image-capabilities.js";
 import { registerImageRoutes } from "./images.js";
 import { registerSecurityHeaders } from "./security.js";
 import {
@@ -35,6 +36,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const baseConfig = cloneAppConfig(options.config ?? loadConfig());
   const config = cloneAppConfig(baseConfig);
   const directories = await prepareDataDirectories(config.dataDir);
+  const imageFormatReadiness = assertImageFormatsReady();
+  await imageFormatReadiness;
   const database = await openDatabase(config.databasePath, config.migrationsDir);
   applyStoredRuntimeSettings(database, config, baseConfig);
   const storage = options.storage ?? createMediaStorage(config, directories);
@@ -45,9 +48,32 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     disableRequestLogging: false,
   });
 
-  registerSecurityHeaders(app, config);
+  app.setErrorHandler((error, request, reply) => {
+    request.log.error({ err: error }, "Unhandled request error");
+    const responseError = error as { statusCode?: unknown };
+    const candidateStatusCode = responseError.statusCode;
+    const statusCode = typeof candidateStatusCode === "number" && candidateStatusCode >= 400 && candidateStatusCode < 500
+      ? candidateStatusCode
+      : 500;
+    const errorCodes: Record<number, string> = {
+      400: "BAD_REQUEST",
+      401: "UNAUTHORIZED",
+      403: "FORBIDDEN",
+      404: "NOT_FOUND",
+      413: "PAYLOAD_TOO_LARGE",
+      415: "UNSUPPORTED_MEDIA_TYPE",
+      422: "UNPROCESSABLE_ENTITY",
+      429: "RATE_LIMITED",
+    };
+    return reply.code(statusCode).send({
+      status: "error",
+      code: errorCodes[statusCode] ?? "INTERNAL_ERROR",
+    });
+  });
 
-  await app.register(cookie);
+  registerSecurityHeaders(app, config, database);
+
+  await app.register(cookie, { secret: config.appSecret });
   await app.register(multipart, {
     limits: {
       files: 1,
@@ -103,6 +129,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     try {
       assertDatabaseReady(database);
       await assertDirectoryWritable(directories.temporary);
+      await imageFormatReadiness;
       return { status: "ready" };
     } catch (error) {
       app.log.error({ err: error }, "Readiness check failed");

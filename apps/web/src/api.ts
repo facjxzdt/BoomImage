@@ -78,7 +78,7 @@ export const api = {
       headers: { "x-csrf-token": csrfToken() },
     }),
   deleteImage: (id: string) =>
-    jsonRequest<void>(`/api/v1/images/${encodeURIComponent(id)}`, {
+    jsonRequest<{ accepted?: true; cleanup?: "pending" } | undefined>(`/api/v1/images/${encodeURIComponent(id)}`, {
       method: "DELETE",
       headers: { "x-csrf-token": csrfToken() },
     }),

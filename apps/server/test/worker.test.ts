@@ -50,6 +50,13 @@ class MemoryMediaStorage implements MediaStorage {
   }
 }
 
+class FailingDeleteStorage extends MemoryMediaStorage {
+  async delete(media: StoredMedia): Promise<void> {
+    if (media.storageDriver === "local") throw new Error("delete failed for test");
+    return super.delete(media);
+  }
+}
+
 afterEach(async () => {
   await Promise.all(cleanupDirectories.splice(0).map((path) => rm(path, { recursive: true })));
 });
@@ -254,6 +261,93 @@ describe("image conversion worker", () => {
       for (const variant of variants) {
         expect(memoryStorage.files.get(`s3:${variant.path}`)?.byteLength).toBeGreaterThan(0);
       }
+    } finally {
+      fixture.database.close();
+      await fixture.app.close();
+    }
+  });
+
+  it("deletes soft-deleted media through a persistent job", async () => {
+    const fixture = await uploadedImageFixture();
+    const image = fixture.database
+      .prepare("SELECT original_path FROM images WHERE id = ?")
+      .get(fixture.imageId) as unknown as { original_path: string };
+    const deletionTime = new Date().toISOString();
+    fixture.database
+      .prepare("UPDATE images SET deleted_at = ?, updated_at = ? WHERE id = ?")
+      .run(deletionTime, deletionTime, fixture.imageId);
+    fixture.database
+      .prepare(
+        `INSERT INTO jobs (id, type, image_id, state, attempts, available_at, created_at, updated_at)
+         VALUES ('delete-job', 'delete_files', ?, 'pending', 0, ?, ?, ?)`,
+      )
+      .run(fixture.imageId, deletionTime, deletionTime, deletionTime);
+
+    const worker = new ImageWorker({
+      database: fixture.database,
+      config: fixture.config,
+      directories: fixture.directories,
+      storage: fixture.storage,
+      logger,
+    });
+
+    try {
+      expect(await worker.processNextJob("delete-worker")).toBe(true);
+      const deletedImage = fixture.database
+        .prepare("SELECT id FROM images WHERE id = ?")
+        .get(fixture.imageId);
+      const deletedJob = fixture.database
+        .prepare("SELECT id FROM jobs WHERE id = 'delete-job'")
+        .get();
+      expect(deletedImage).toBeUndefined();
+      expect(deletedJob).toBeUndefined();
+      await expect(stat(join(fixture.config.dataDir, ...image.original_path.split("/")))).rejects.toThrow();
+    } finally {
+      fixture.database.close();
+      await fixture.app.close();
+    }
+  });
+
+  it("retries delete jobs when media deletion fails", async () => {
+    const fixture = await uploadedImageFixture();
+    const deletionTime = new Date().toISOString();
+    fixture.database
+      .prepare("UPDATE images SET deleted_at = ?, updated_at = ? WHERE id = ?")
+      .run(deletionTime, deletionTime, fixture.imageId);
+    fixture.database
+      .prepare(
+        `INSERT INTO jobs (id, type, image_id, state, attempts, available_at, created_at, updated_at)
+         VALUES ('failing-delete-job', 'delete_files', ?, 'pending', 0, ?, ?, ?)`,
+      )
+      .run(fixture.imageId, deletionTime, deletionTime, deletionTime);
+
+    const worker = new ImageWorker({
+      database: fixture.database,
+      config: fixture.config,
+      directories: fixture.directories,
+      storage: new FailingDeleteStorage(fixture.storage),
+      logger,
+    });
+
+    try {
+      for (let attempt = 1; attempt <= fixture.config.jobMaxAttempts; attempt += 1) {
+        expect(await worker.processNextJob("failing-delete-worker")).toBe(true);
+        if (attempt < fixture.config.jobMaxAttempts) {
+          fixture.database
+            .prepare("UPDATE jobs SET available_at = ? WHERE id = 'failing-delete-job'")
+            .run(new Date(Date.now() - 1_000).toISOString());
+        }
+      }
+      const job = fixture.database
+        .prepare("SELECT state, attempts, last_error FROM jobs WHERE id = 'failing-delete-job'")
+        .get() as unknown as { state: string; attempts: number; last_error: string };
+      const image = fixture.database
+        .prepare("SELECT deleted_at FROM images WHERE id = ?")
+        .get(fixture.imageId) as unknown as { deleted_at: string | null };
+      expect(job.state).toBe("failed");
+      expect(job.attempts).toBe(fixture.config.jobMaxAttempts);
+      expect(job.last_error).toContain("delete failed for test");
+      expect(image.deleted_at).not.toBeNull();
     } finally {
       fixture.database.close();
       await fixture.app.close();

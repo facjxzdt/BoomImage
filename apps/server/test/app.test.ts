@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -86,6 +87,61 @@ describe("BoomImage application", () => {
     await app.close();
   });
 
+  it("allows historical S3 direct image origins from stored snapshots in CSP", async () => {
+    const config = await testConfig();
+    config.s3.bucket = "new-bucket";
+    config.s3.region = "auto";
+    config.s3.publicBaseUrl = "https://new-cdn.example.test";
+    const app = await buildApp({ config, logger: false });
+    const database = new DatabaseSync(config.databasePath);
+    try {
+      const now = new Date().toISOString();
+      database.exec("PRAGMA busy_timeout = 5000");
+      database
+        .prepare(
+          `INSERT INTO images
+            (id, sha256, original_name, original_mime, original_ext, original_path,
+             width, height, size_bytes, has_alpha, is_animated, status, storage_driver, access_mode,
+             s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style,
+             created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "historical-s3-image",
+          "0".repeat(64),
+          "old.png",
+          "image/png",
+          "png",
+          "originals/00/00/old.png",
+          1,
+          1,
+          1,
+          0,
+          0,
+          "ready",
+          "s3",
+          "direct",
+          "old-bucket",
+          "old-prefix/originals/00/00/old.png",
+          "https://old-s3.example.test",
+          "auto",
+          "https://old-cdn.example.test",
+          1,
+          now,
+          now,
+        );
+    } finally {
+      database.close();
+    }
+
+    const response = await app.inject({ method: "GET", url: "/health/live" });
+
+    expect(response.headers["content-security-policy"]).toContain("https://new-cdn.example.test");
+    expect(response.headers["content-security-policy"]).toContain("https://old-cdn.example.test");
+    expect(response.headers["content-security-policy"]).toContain("https://old-s3.example.test");
+    await app.close();
+  });
+
   it("allows public media to be embedded cross-origin", async () => {
     const app = await buildApp({ config: await testConfig(), logger: false });
     const response = await app.inject({ method: "GET", url: "/media/proxy/not-found.webp" });
@@ -100,6 +156,20 @@ describe("BoomImage application", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ status: "ready" });
+    await app.close();
+  });
+
+  it("sanitizes unexpected error responses", async () => {
+    const app = await buildApp({ config: await testConfig(), logger: false });
+    app.get("/test/internal-error", async () => {
+      throw new Error("C:\\Users\\facjx\\Desktop\\BoomImage\\data\\secret-token");
+    });
+    const response = await app.inject({ method: "GET", url: "/test/internal-error" });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ status: "error", code: "INTERNAL_ERROR" });
+    expect(response.body).not.toContain("BoomImage");
+    expect(response.body).not.toContain("secret-token");
     await app.close();
   });
 

@@ -5,22 +5,28 @@ import sharp, { type OutputInfo } from "sharp";
 import type { AppConfig } from "./config.js";
 import { immediateTransaction, type AppDatabase } from "./database.js";
 import type { DataDirectories } from "./filesystem.js";
+import { s3LocationFromColumns, type StoredS3LocationColumns } from "./storage-snapshot.js";
 import type { MediaAccessMode, MediaStorage } from "./storage.js";
 
 interface ClaimedJob {
   id: string;
+  type: "generate_variants" | "delete_files";
   imageId: string;
   attempts: number;
 }
 
-interface ImageSourceRow {
+interface ImageSourceRow extends StoredS3LocationColumns {
   original_path: string;
   storage_driver: "local" | "s3";
   access_mode: MediaAccessMode;
   original_mime: string;
 }
 
-interface VariantJobRow {
+interface DeletedImageRow extends ImageSourceRow {
+  deleted_at: string | null;
+}
+
+interface VariantJobRow extends StoredS3LocationColumns {
   id: string;
   profile: "display" | "thumb";
   format: "avif" | "webp";
@@ -110,7 +116,7 @@ export class ImageWorker {
     const job = this.#claimJob(workerId);
     if (!job) return false;
 
-    this.#logger.info({ jobId: job.id, imageId: job.imageId, attempts: job.attempts }, "Processing image job");
+    this.#logger.info({ jobId: job.id, jobType: job.type, imageId: job.imageId, attempts: job.attempts }, "Processing image job");
     await this.#processClaimedJob(job);
     return true;
   }
@@ -120,19 +126,18 @@ export class ImageWorker {
       const now = new Date();
       const row = this.#database
         .prepare(
-          `SELECT id, image_id, attempts
+          `SELECT id, type, image_id, attempts
            FROM jobs
-           WHERE type = 'generate_variants'
-             AND attempts < ?
+           WHERE attempts < ?
              AND (
                (state = 'pending' AND available_at <= ?)
                OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= ?)
              )
-           ORDER BY available_at, created_at
+           ORDER BY CASE type WHEN 'delete_files' THEN 0 ELSE 1 END, available_at, created_at
            LIMIT 1`,
         )
         .get(this.#config.jobMaxAttempts, now.toISOString(), now.toISOString()) as unknown as
-        | { id: string; image_id: string; attempts: number }
+        | { id: string; type: "generate_variants" | "delete_files"; image_id: string; attempts: number }
         | undefined;
       if (!row) return undefined;
 
@@ -146,15 +151,24 @@ export class ImageWorker {
         )
         .run(attempts, leaseUntil, workerId, now.toISOString(), row.id);
       this.#database
-        .prepare("UPDATE images SET status = 'processing', updated_at = ? WHERE id = ?")
+        .prepare("UPDATE images SET status = 'processing', updated_at = ? WHERE id = ? AND deleted_at IS NULL")
         .run(now.toISOString(), row.image_id);
-      return { id: row.id, imageId: row.image_id, attempts };
+      return { id: row.id, type: row.type, imageId: row.image_id, attempts };
     });
   }
 
   async #processClaimedJob(job: ClaimedJob): Promise<void> {
+    if (job.type === "delete_files") {
+      await this.#processDeleteFilesJob(job);
+      return;
+    }
+
     const image = this.#database
-      .prepare("SELECT original_path, original_mime, storage_driver, access_mode FROM images WHERE id = ? AND deleted_at IS NULL")
+      .prepare(
+        `SELECT original_path, original_mime, storage_driver, access_mode,
+                s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style
+         FROM images WHERE id = ? AND deleted_at IS NULL`,
+      )
       .get(job.imageId) as unknown as ImageSourceRow | undefined;
     if (!image) {
       this.#finishMissingImage(job);
@@ -163,7 +177,8 @@ export class ImageWorker {
 
     const variants = this.#database
       .prepare(
-        `SELECT id, profile, format, path, status
+        `SELECT id, profile, format, path, status,
+                s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style
          FROM variants WHERE image_id = ? AND status != 'ready'
          ORDER BY profile, format`,
       )
@@ -178,6 +193,7 @@ export class ImageWorker {
         accessMode: image.access_mode,
         path: image.original_path,
         contentType: image.original_mime,
+        s3: s3LocationFromColumns(image),
       }, sourcePath);
       for (const variant of variants) {
         try {
@@ -200,6 +216,64 @@ export class ImageWorker {
       this.#scheduleRetry(job, failures);
     } else {
       this.#finishFailedJob(job, failures);
+    }
+  }
+
+  async #processDeleteFilesJob(job: ClaimedJob): Promise<void> {
+    const image = this.#database
+      .prepare(
+        `SELECT original_path, original_mime, storage_driver, access_mode, deleted_at,
+                s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style
+         FROM images WHERE id = ?`,
+      )
+      .get(job.imageId) as unknown as DeletedImageRow | undefined;
+    if (!image) {
+      this.#finishSuccessfulDeleteJob(job);
+      return;
+    }
+    if (image.deleted_at === null) {
+      this.#finishFailedDeleteJob(job, ["Image is not soft-deleted"]);
+      return;
+    }
+
+    const variants = this.#database
+      .prepare(
+        `SELECT path, s3_bucket, s3_object_key, s3_endpoint, s3_region,
+                s3_public_base_url, s3_force_path_style
+         FROM variants WHERE image_id = ?`,
+      )
+      .all(job.imageId) as unknown as Array<{ path: string } & StoredS3LocationColumns>;
+    const medias = [
+      {
+        storageDriver: image.storage_driver,
+        accessMode: image.access_mode,
+        path: image.original_path,
+        contentType: image.original_mime,
+        s3: s3LocationFromColumns(image),
+      },
+      ...variants.map((variant) => ({
+        storageDriver: image.storage_driver,
+        accessMode: image.access_mode,
+        path: variant.path,
+        s3: s3LocationFromColumns(variant),
+      })),
+    ];
+    const failures: string[] = [];
+
+    for (const media of medias) {
+      try {
+        await this.#storage.delete(media);
+      } catch (error) {
+        failures.push(`${media.path}: ${errorMessage(error, this.#directories.root)}`);
+      }
+    }
+
+    if (failures.length === 0) {
+      this.#finishSuccessfulDeleteJob(job);
+    } else if (job.attempts < this.#config.jobMaxAttempts) {
+      this.#scheduleDeleteRetry(job, failures);
+    } else {
+      this.#finishFailedDeleteJob(job, failures);
     }
   }
 
@@ -239,6 +313,7 @@ export class ImageWorker {
           path: variant.path,
           sourcePath: temporaryPath,
           contentType: `image/${variant.format}`,
+          s3: s3LocationFromColumns(variant),
           move: true,
         });
       }
@@ -271,6 +346,13 @@ export class ImageWorker {
       this.#database
         .prepare("UPDATE images SET status = 'ready', updated_at = ? WHERE id = ?")
         .run(now, job.imageId);
+    });
+  }
+
+  #finishSuccessfulDeleteJob(job: ClaimedJob): void {
+    immediateTransaction(this.#database, () => {
+      this.#database.prepare("DELETE FROM jobs WHERE id = ?").run(job.id);
+      this.#database.prepare("DELETE FROM images WHERE id = ?").run(job.imageId);
     });
   }
 
@@ -324,6 +406,30 @@ export class ImageWorker {
         .prepare("UPDATE images SET status = ?, updated_at = ? WHERE id = ?")
         .run(Number(readyCount.count) > 0 ? "partial" : "failed", now, job.imageId);
     });
+  }
+
+  #scheduleDeleteRetry(job: ClaimedJob, failures: string[]): void {
+    const now = new Date();
+    const retryAt = new Date(now.getTime() + Math.min(60, 2 ** job.attempts) * 1_000).toISOString();
+    const combinedError = failures.join("; ").slice(0, 2_000);
+    immediateTransaction(this.#database, () => {
+      this.#database
+        .prepare(
+          `UPDATE jobs SET state = 'pending', available_at = ?, lease_until = NULL,
+             worker_id = NULL, last_error = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(retryAt, combinedError, now.toISOString(), job.id);
+    });
+  }
+
+  #finishFailedDeleteJob(job: ClaimedJob, failures: string[]): void {
+    const now = new Date().toISOString();
+    this.#database
+      .prepare(
+        `UPDATE jobs SET state = 'failed', lease_until = NULL, worker_id = NULL,
+           last_error = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(failures.join("; ").slice(0, 2_000), now, job.id);
   }
 
   #finishMissingImage(job: ClaimedJob): void {

@@ -31,6 +31,24 @@ describe("configuration", () => {
     expect(config.tmpCleanupIntervalSeconds).toBe(0);
   });
 
+  it("loads and validates the application secret", () => {
+    const config = loadConfig({
+      APP_SECRET: "x".repeat(32),
+    });
+
+    expect(config.appSecret).toBe("x".repeat(32));
+    expect(() => loadConfig({ APP_SECRET: "too-short" })).toThrow(/APP_SECRET/);
+    expect(loadConfig({ NODE_ENV: "development" }).appSecret).toContain("development-secret");
+    expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(/APP_SECRET/);
+    expect(() =>
+      loadConfig({
+        NODE_ENV: "production",
+        APP_SECRET: "change-me-before-production-use-32-chars",
+      }),
+    ).toThrow(/APP_SECRET/);
+    expect(loadConfig({ NODE_ENV: "production", APP_SECRET: "p".repeat(48) }).appSecret).toBe("p".repeat(48));
+  });
+
   it("loads S3 storage settings", () => {
     const config = loadConfig({
       STORAGE_DRIVER: "s3",

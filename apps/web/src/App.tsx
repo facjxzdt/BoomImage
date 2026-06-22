@@ -27,6 +27,8 @@ const errorMessages: Record<string, string> = {
   NETWORK_ERROR: "无法连接到服务",
   INVALID_SETTINGS: "设置无效，请检查必填项和取值范围",
   S3_NOT_CONFIGURED: "S3 尚未配置完整",
+  IMAGE_DELETE_PENDING: "同一图片正在异步删除，请稍后再上传",
+  IMAGE_DELETE_REQUEUED: "同一图片此前删除失败，清理任务已重新排队，请稍后再上传",
 };
 
 const brandMarkClass =
@@ -200,13 +202,14 @@ function AuthPanel({ mode, onAuthenticated }: { mode: "setup" | "login"; onAuthe
   );
 }
 
-function UploadZone({ onFiles }: { onFiles: (files: File[]) => void }) {
+function UploadZone({ disabled = false, onFiles }: { disabled?: boolean; onFiles: (files: File[]) => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
 
   function drop(event: DragEvent) {
     event.preventDefault();
     setDragging(false);
+    if (disabled) return;
     onFiles(Array.from(event.dataTransfer.files));
   }
 
@@ -217,8 +220,9 @@ function UploadZone({ onFiles }: { onFiles: (files: File[]) => void }) {
         "before:absolute before:inset-0 before:bg-[radial-gradient(circle_at_20%_20%,rgba(37,99,235,0.12),transparent_30%),radial-gradient(circle_at_80%_0%,rgba(20,184,166,0.11),transparent_28%)] before:opacity-80 before:transition",
         "hover:-translate-y-0.5 hover:border-blue-500/70 hover:bg-white hover:shadow-[0_16px_40px_rgba(32,55,84,0.10)]",
         dragging && "-translate-y-0.5 border-blue-500/70 bg-white shadow-[0_16px_40px_rgba(32,55,84,0.10)] before:opacity-100",
+        disabled && "cursor-not-allowed opacity-60 hover:translate-y-0 hover:border-slate-300 hover:bg-white/80 hover:shadow-sm",
       )}
-      onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+      onDragEnter={(event) => { event.preventDefault(); if (!disabled) setDragging(true); }}
       onDragOver={(event) => event.preventDefault()}
       onDragLeave={(event) => { if (event.currentTarget === event.target) setDragging(false); }}
       onDrop={drop}
@@ -229,7 +233,9 @@ function UploadZone({ onFiles }: { onFiles: (files: File[]) => void }) {
         accept="image/jpeg,image/png,image/webp,image/gif,image/avif"
         multiple
         hidden
+        disabled={disabled}
         onChange={(event) => {
+          if (disabled) return;
           onFiles(Array.from(event.target.files ?? []));
           event.target.value = "";
         }}
@@ -237,6 +243,7 @@ function UploadZone({ onFiles }: { onFiles: (files: File[]) => void }) {
       <button
         type="button"
         className="relative grid min-h-[204px] w-full place-items-center content-center gap-2 border-0 bg-transparent px-5 text-slate-700"
+        disabled={disabled}
         onClick={() => inputRef.current?.click()}
       >
         <span className="mb-2 grid h-14 w-14 place-items-center rounded-2xl bg-white text-3xl text-blue-600 shadow-[0_14px_32px_rgba(37,99,235,0.14),inset_0_0_0_1px_rgba(37,99,235,0.10)] transition group-hover:scale-105" aria-hidden="true">↑</span>
@@ -398,7 +405,13 @@ function numberInputValue(value: number): string {
   return Number.isFinite(value) ? String(value) : "";
 }
 
-function SettingsPanel({ onClose }: { onClose: () => void }) {
+function SettingsPanel({
+  onClose,
+  onSaved,
+}: {
+  onClose: () => void;
+  onSaved: (settings: RuntimeSettings) => void;
+}) {
   const [settings, setSettings] = useState<RuntimeSettings | null>(null);
   const [secretAccessKey, setSecretAccessKey] = useState("");
   const [sessionToken, setSessionToken] = useState("");
@@ -450,6 +463,7 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
       };
       const response = await api.updateSettings(payload);
       setSettings(response.settings);
+      onSaved(response.settings);
       setSecretAccessKey("");
       setSessionToken("");
       setClearSecretAccessKey(false);
@@ -612,6 +626,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [uploadStorage, setUploadStorage] = useState<UploadStorageDriver>("local");
   const [uploadAccess, setUploadAccess] = useState<UploadAccessMode>("direct");
+  const [uploadDefaultsLoaded, setUploadDefaultsLoaded] = useState(false);
   const readyCount = images.filter((image) => image.status === "ready").length;
   const processingCount = images.filter((image) => image.status === "pending" || image.status === "processing").length;
   const totalBytes = images.reduce((sum, image) => sum + image.sizeBytes, 0);
@@ -630,6 +645,22 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
   }, [onLogout]);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    let cancelled = false;
+    void api.settings()
+      .then(({ settings }) => {
+        if (cancelled) return;
+        setUploadStorage(settings.storageDriver);
+        setUploadAccess(settings.storageAccessMode);
+        setUploadDefaultsLoaded(true);
+      })
+      .catch((settingsError) => {
+        if (settingsError instanceof ApiError && settingsError.status === 401) onLogout();
+        else setError(friendlyError(settingsError));
+        setUploadDefaultsLoaded(true);
+      });
+    return () => { cancelled = true; };
+  }, [onLogout]);
   const hasActiveConversions = useMemo(
     () => images.some((image) => image.status === "pending" || image.status === "processing"),
     [images],
@@ -646,6 +677,10 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
   }, [toast]);
 
   async function addFiles(files: File[]) {
+    if (!uploadDefaultsLoaded) {
+      setError("正在读取默认上传策略，请稍后再上传");
+      return;
+    }
     for (const file of files) {
       const id = `${file.name}-${file.lastModified}-${Math.random()}`;
       setUploads((current) => [...current, { id, name: file.name, progress: 0, state: "uploading" }]);
@@ -688,8 +723,12 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
   async function deleteImage(image: ImageItem) {
     if (!window.confirm(`确定删除“${image.originalName}”及其所有变体吗？`)) return;
     try {
-      await api.deleteImage(image.id);
+      const result = await api.deleteImage(image.id);
       setImages((current) => current.filter((item) => item.id !== image.id));
+      if (result?.cleanup === "pending") {
+        setToast("图片已从列表移除，后台继续清理公开文件");
+        return;
+      }
       setToast("图片已删除");
     } catch (deleteError) {
       setError(friendlyError(deleteError));
@@ -697,6 +736,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
   }
 
   function pasteImages(event: ClipboardEvent<HTMLDivElement>) {
+    if (!uploadDefaultsLoaded) return;
     const files = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"));
     if (files.length > 0) {
       event.preventDefault();
@@ -739,7 +779,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
           <div>
             <h2 className="text-sm font-black text-slate-950">上传存储策略</h2>
             <p className="mt-1 text-xs leading-relaxed text-slate-500">
-              当前上传到 {uploadStorage === "local" ? "本地磁盘" : uploadAccess === "proxy" ? "S3，并通过服务器代理访问" : "S3，并返回 S3/CDN 直链"}。
+              {uploadDefaultsLoaded ? `当前上传到 ${uploadStorage === "local" ? "本地磁盘" : uploadAccess === "proxy" ? "S3，并通过服务器代理访问" : "S3，并返回 S3/CDN 直链"}。` : "正在读取默认上传策略…"}
             </p>
           </div>
           <div className="grid gap-2 sm:grid-cols-2">
@@ -748,6 +788,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
               <select
                 className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-bold normal-case tracking-normal text-slate-700 outline-none focus:border-blue-400"
                 value={uploadStorage}
+                disabled={!uploadDefaultsLoaded}
                 onChange={(event) => setUploadStorage(event.target.value as UploadStorageDriver)}
               >
                 <option value="local">本地</option>
@@ -759,7 +800,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
               <select
                 className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-bold normal-case tracking-normal text-slate-700 outline-none focus:border-blue-400 disabled:cursor-not-allowed"
                 value={uploadAccess}
-                disabled={uploadStorage === "local"}
+                disabled={!uploadDefaultsLoaded || uploadStorage === "local"}
                 onChange={(event) => setUploadAccess(event.target.value as UploadAccessMode)}
               >
                 <option value="direct">S3 直链</option>
@@ -768,7 +809,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
             </label>
           </div>
         </section>
-        <UploadZone onFiles={(files) => void addFiles(files)} />
+        <UploadZone disabled={!uploadDefaultsLoaded} onFiles={(files) => void addFiles(files)} />
         {uploads.length > 0 && (
           <section className="mt-3 grid gap-2" aria-live="polite">
             {uploads.map((entry) => (
@@ -815,7 +856,15 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
         )}
       </main>
       {toast && <div className="fixed bottom-8 left-1/2 z-30 -translate-x-1/2 rounded-full border border-blue-200 bg-white/95 px-4 py-2.5 text-xs font-black text-blue-800 shadow-[0_16px_40px_rgba(32,55,84,0.10)]" role="status">✓ {toast}</div>}
-      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsPanel
+          onClose={() => setSettingsOpen(false)}
+          onSaved={(settings) => {
+            setUploadStorage(settings.storageDriver);
+            setUploadAccess(settings.storageAccessMode);
+          }}
+        />
+      )}
       {tokensOpen && <TokenPanel onClose={() => setTokensOpen(false)} />}
     </div>
   );

@@ -70,6 +70,7 @@ describe("administrator authentication", () => {
     expect(csrfCookie).not.toContain("HttpOnly");
 
     const cookie = cookieFrom(setup);
+    expect(cookie).toContain(".");
     const me = await app.inject({
       method: "GET",
       url: "/api/v1/auth/me",
@@ -84,6 +85,24 @@ describe("administrator authentication", () => {
       payload: { password },
     });
     expect(secondSetup.statusCode).toBe(409);
+    await app.close();
+  });
+
+  it("rejects tampered signed session cookies", async () => {
+    const app = await createTestApp();
+    const setup = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/setup",
+      payload: { password },
+    });
+    const cookie = cookieFrom(setup);
+    const tamperedCookie = `${cookie}x`;
+    const me = await app.inject({
+      method: "GET",
+      url: "/api/v1/auth/me",
+      headers: { cookie: tamperedCookie },
+    });
+    expect(me.statusCode).toBe(401);
     await app.close();
   });
 

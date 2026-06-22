@@ -21,9 +21,11 @@
 - 发布前安全加固已推进：登录/初始化固定窗口限流、CSP、HSTS 条件启用、`nosniff`、`DENY` frame 防护、Referrer 与 Permissions Policy 已实现。
 - 临时文件清理已实现：上传和转换临时文件统一写入 `data/tmp`，后台维护任务定期清理过期普通文件，清理前进行目录边界校验，不递归、不跟随目录或链接。
 - CI/CD 已添加：GitHub Actions 负责类型检查、测试、生产构建，以及在 GitHub 上构建并推送 GHCR Docker 镜像；本地 `compose.yaml` 默认拉取远程镜像，`compose.build.yaml` 仅作为显式本地构建覆盖文件。
-- S3 兼容存储已实现：上传时可选 `local` 或 `s3`，S3 媒体可选对象存储/CDN 直链或 `/media/proxy/*` 服务器代理；Worker 可从 S3 取回原图生成变体并写回同一存储后端。
+- S3 兼容存储已实现：上传时可选 `local` 或 `s3`，S3 媒体可选对象存储/CDN 直链或 `/media/proxy/*` 服务器代理；Worker 可从 S3 取回原图生成变体并写回同一存储后端；图片和变体会保存实际 bucket、object key、Endpoint、Region、公开基址和 path-style 快照，后续修改默认 S3 位置配置不会让旧对象漂移；私有 bucket 仍要求当前凭证有权限访问旧对象。
 - 管理界面运行设置已实现：管理员可在 UI 中修改公开地址、上传/解码限制、转换质量、默认存储策略和 S3 连接信息；设置保存到 SQLite 的 `app_settings` 并覆盖 `.env` 默认值，启动级配置仍由 `.env` 管理。
-- 当前完整回归为 30 项服务端测试，前后端类型检查、前后端生产构建、备份命令实跑均通过。
+- 删除流程已改为软删除加同步物理清理优先，并保留持久化 `delete_files` 任务兜底重试；公开媒体本轮清理成功返回 `204`，失败则返回 `202` 并后台继续清理；失败删除任务在同内容重复上传时会自动重新排队，避免哈希永久阻塞；会话 Cookie 已接入 `APP_SECRET` 签名，生产环境拒绝公开默认密钥。
+- 错误响应已统一脱敏：未捕获异常只记录到服务端日志，客户端收到稳定错误结构；启动和 `/health/ready` 会实际验证 Sharp/libvips 的 AVIF 与 WebP 编码能力。
+- 当前完整回归为 38 项服务端测试，前后端类型检查和前后端生产构建均通过。
 - 下一步建议执行：真实浏览器视觉走查、上传压测、备份恢复演练、Windows/Linux 路径兼容复查和首个版本发布。
 
 ## 1. 项目目标
@@ -138,7 +140,7 @@ data/
 - 临时文件与最终文件必须处于同一文件系统，以支持原子重命名。
 - Caddy 只读挂载 `originals` 和 `variants`。
 - 数据库只存路径和元数据，不存图片 BLOB。
-- S3 模式下数据库保存对象 key、存储后端和访问模式；对象 key 仍由服务端根据内容哈希生成。
+- S3 模式下数据库保存对象 key、bucket、Endpoint、Region、公开基址、path-style、存储后端和访问模式；对象 key 仍由服务端根据内容哈希生成，并在上传时固化到图片和变体记录，避免后续修改默认 S3 位置配置导致旧对象定位漂移。数据库不保存访问密钥，S3 proxy、Worker 读取和删除清理使用当前凭证，因此更换账号或密钥前必须确认新凭证仍可访问旧 bucket。
 
 ## 7. 上传和转换流程
 
@@ -201,6 +203,14 @@ size_bytes          INTEGER NOT NULL
 has_alpha           INTEGER NOT NULL
 is_animated         INTEGER NOT NULL
 status              TEXT NOT NULL          # pending|processing|ready|partial|failed
+storage_driver      TEXT NOT NULL          # local|s3
+access_mode         TEXT NOT NULL          # direct|proxy
+s3_bucket           TEXT NULL
+s3_object_key       TEXT NULL
+s3_endpoint         TEXT NULL
+s3_region           TEXT NULL
+s3_public_base_url  TEXT NULL
+s3_force_path_style INTEGER NULL           # 0|1
 created_at          TEXT NOT NULL
 updated_at          TEXT NOT NULL
 deleted_at          TEXT NULL
@@ -219,6 +229,12 @@ height               INTEGER NULL
 size_bytes          INTEGER NULL
 status              TEXT NOT NULL          # pending|ready|failed
 error               TEXT NULL
+s3_bucket           TEXT NULL
+s3_object_key       TEXT NULL
+s3_endpoint         TEXT NULL
+s3_region           TEXT NULL
+s3_public_base_url  TEXT NULL
+s3_force_path_style INTEGER NULL           # 0|1
 created_at          TEXT NOT NULL
 updated_at          TEXT NOT NULL
 UNIQUE(image_id, profile, format)
@@ -312,7 +328,7 @@ Cache-Control: public, max-age=31536000, immutable
 - 限制 multipart 字段数量、文件数量、请求超时和上传速率。
 - 验证 magic bytes、解码结果和文件扩展名的一致性。
 - 所有数据库语句参数化，文件路径只能由服务端生成。
-- 错误响应不能暴露真实磁盘路径、堆栈、密码哈希或 Token。
+- 错误响应不能暴露真实磁盘路径、堆栈、密码哈希、S3 密钥或 Token；未捕获异常应记录到服务端日志，客户端只返回稳定错误码。
 - 定期清理超时临时文件，但只能清理 `/data/tmp` 内经过校验的路径。
 - 容器使用非 root 用户；Caddy 对媒体目录只读。
 
@@ -383,7 +399,7 @@ WEBP_QUALITY=82
 - 每个请求包含 request ID。
 - 记录上传耗时、转换耗时、输入输出大小、任务重试和失败原因。
 - `/health/live` 只检查进程存活。
-- `/health/ready` 检查数据库可读写、数据目录可用和迁移完成。
+- `/health/ready` 检查数据库可读写、数据目录可用、迁移完成，以及 Sharp/libvips 是否能实际编码 AVIF 与 WebP。
 - 第一版不强制接入 Prometheus，但日志字段需为后续指标化做好准备。
 
 ## 17. 测试和验收标准

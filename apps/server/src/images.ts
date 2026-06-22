@@ -11,6 +11,12 @@ import { requireAuthentication } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { immediateTransaction, type AppDatabase } from "./database.js";
 import type { DataDirectories } from "./filesystem.js";
+import {
+  s3LocationForStoredPath,
+  s3LocationFromColumns,
+  s3LocationValues,
+  type StoredS3LocationColumns,
+} from "./storage-snapshot.js";
 import type { MediaAccessMode, MediaStorage, StoredMedia } from "./storage.js";
 
 interface DetectedImageType {
@@ -18,7 +24,7 @@ interface DetectedImageType {
   mime: "image/jpeg" | "image/png" | "image/webp" | "image/gif" | "image/avif";
 }
 
-interface ImageRow {
+interface ImageRow extends StoredS3LocationColumns {
   id: string;
   sha256: string;
   original_name: string;
@@ -36,7 +42,7 @@ interface ImageRow {
   updated_at: string;
 }
 
-interface VariantRow {
+interface VariantRow extends StoredS3LocationColumns {
   profile: string;
   format: string;
   path: string;
@@ -47,11 +53,24 @@ interface VariantRow {
   error: string | null;
 }
 
-function hashingTransform(hash: Hash, countBytes: (size: number) => void): Transform {
+class UploadTooLargeError extends Error {
+  constructor() {
+    super("Uploaded file exceeds the configured size limit");
+  }
+}
+
+function hashingTransform(
+  hash: Hash,
+  options: { maxBytes: number; countBytes: (size: number) => number },
+): Transform {
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
+      const totalBytes = options.countBytes(chunk.length);
+      if (totalBytes > options.maxBytes) {
+        callback(new UploadTooLargeError());
+        return;
+      }
       hash.update(chunk);
-      countBytes(chunk.length);
       callback(null, chunk);
     },
   });
@@ -101,6 +120,7 @@ function getImage(database: AppDatabase, id: string): ImageRow | undefined {
     .prepare(
       `SELECT id, sha256, original_name, original_mime, original_path, width, height,
               size_bytes, has_alpha, is_animated, status, storage_driver, access_mode,
+              s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style,
               created_at, updated_at
        FROM images WHERE id = ? AND deleted_at IS NULL`,
     )
@@ -111,6 +131,7 @@ function serializeImage(database: AppDatabase, storage: MediaStorage, image: Ima
   const variants = database
     .prepare(
       `SELECT profile, format, path, width, height, size_bytes, status, error
+              , s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style
        FROM variants WHERE image_id = ? ORDER BY profile, format`,
     )
     .all(image.id) as unknown as VariantRow[];
@@ -135,6 +156,7 @@ function serializeImage(database: AppDatabase, storage: MediaStorage, image: Ima
       accessMode: image.access_mode,
       path: image.original_path,
       contentType: image.original_mime,
+      s3: s3LocationFromColumns(image),
     }),
     variants: variants.map((variant) => ({
       profile: variant.profile,
@@ -149,6 +171,7 @@ function serializeImage(database: AppDatabase, storage: MediaStorage, image: Ima
           storageDriver: image.storage_driver,
           accessMode: image.access_mode,
           path: variant.path,
+          s3: s3LocationFromColumns(variant),
         })
         : null,
     })),
@@ -182,6 +205,73 @@ function normalizeMediaPath(path: string): string {
   return normalized;
 }
 
+function ensureDeleteJobQueuedForDeletedDuplicate(
+  database: AppDatabase,
+  config: AppConfig,
+  imageId: string,
+): "pending" | "requeued" {
+  const now = new Date().toISOString();
+  const existingJob = database
+    .prepare(
+      `SELECT id, state, attempts, lease_until
+       FROM jobs
+       WHERE image_id = ? AND type = 'delete_files'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+    )
+    .get(imageId) as unknown as { id: string; state: string; attempts: number; lease_until: string | null } | undefined;
+
+  if (!existingJob) {
+    database
+      .prepare(
+        `INSERT INTO jobs
+          (id, type, image_id, state, attempts, available_at, created_at, updated_at)
+         VALUES (?, 'delete_files', ?, 'pending', 0, ?, ?, ?)`,
+      )
+      .run(ulid(), imageId, now, now, now);
+    return "requeued";
+  }
+
+  const hasExhaustedStaleLease =
+    existingJob.attempts >= config.jobMaxAttempts
+    && (existingJob.state !== "running" || !existingJob.lease_until || existingJob.lease_until <= now);
+
+  if (existingJob.state === "failed" || hasExhaustedStaleLease) {
+    database
+      .prepare(
+        `UPDATE jobs
+         SET state = 'pending', attempts = 0, available_at = ?, lease_until = NULL,
+             worker_id = NULL, last_error = NULL, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(now, now, existingJob.id);
+    return "requeued";
+  }
+
+  return "pending";
+}
+
+function sanitizeErrorMessage(error: unknown, dataDirectory: string): string {
+  const message = error instanceof Error ? error.message : "Unknown storage cleanup error";
+  return message.split(resolve(dataDirectory)).join("<data>").slice(0, 2_000);
+}
+
+async function deleteStoredMedia(
+  storage: MediaStorage,
+  media: StoredMedia[],
+  dataDirectory: string,
+): Promise<string[]> {
+  const failures: string[] = [];
+  for (const item of media) {
+    try {
+      await storage.delete(item);
+    } catch (error) {
+      failures.push(`${item.path}: ${sanitizeErrorMessage(error, dataDirectory)}`);
+    }
+  }
+  return failures;
+}
+
 export function registerImageRoutes(
   app: FastifyInstance,
   database: AppDatabase,
@@ -201,22 +291,30 @@ export function registerImageRoutes(
       const image = database
         .prepare(
           `SELECT original_mime, storage_driver, access_mode, original_path
+                  , s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style
            FROM images WHERE original_path = ? AND deleted_at IS NULL`,
         )
         .get(mediaPath) as unknown as
-        | { original_mime: string; storage_driver: "local" | "s3"; access_mode: MediaAccessMode; original_path: string }
+        | ({
+          original_mime: string;
+          storage_driver: "local" | "s3";
+          access_mode: MediaAccessMode;
+          original_path: string;
+        } & StoredS3LocationColumns)
         | undefined;
       const variant = image
         ? undefined
         : database
           .prepare(
-            `SELECT i.storage_driver, i.access_mode, v.path
+            `SELECT i.storage_driver, i.access_mode, v.path,
+                    v.s3_bucket, v.s3_object_key, v.s3_endpoint, v.s3_region,
+                    v.s3_public_base_url, v.s3_force_path_style
              FROM variants v
              JOIN images i ON i.id = v.image_id
              WHERE v.path = ? AND v.status = 'ready' AND i.deleted_at IS NULL`,
           )
           .get(mediaPath) as unknown as
-          | { storage_driver: "local" | "s3"; access_mode: MediaAccessMode; path: string }
+          | ({ storage_driver: "local" | "s3"; access_mode: MediaAccessMode; path: string } & StoredS3LocationColumns)
           | undefined;
       const media = image
         ? {
@@ -224,12 +322,14 @@ export function registerImageRoutes(
           accessMode: image.access_mode,
           path: image.original_path,
           contentType: image.original_mime,
+          s3: s3LocationFromColumns(image),
         }
         : variant
           ? {
             storageDriver: variant.storage_driver,
             accessMode: variant.access_mode,
             path: variant.path,
+            s3: s3LocationFromColumns(variant),
           }
           : undefined;
       if (!media) return reply.code(404).send({ status: "error", code: "MEDIA_NOT_FOUND" });
@@ -245,7 +345,10 @@ export function registerImageRoutes(
         return reply.code(415).send({ status: "error", code: "MULTIPART_REQUIRED" });
       }
 
-      const part = await request.file();
+      const part = await request.file({
+        throwFileSizeLimit: false,
+        limits: { fileSize: config.maxUploadBytes },
+      });
       if (!part) return reply.code(400).send({ status: "error", code: "IMAGE_REQUIRED" });
 
       const temporaryPath = join(directories.temporary, `${randomUUID()}.upload`);
@@ -272,8 +375,12 @@ export function registerImageRoutes(
 
         await pipeline(
           part.file,
-          hashingTransform(hash, (size) => {
-            sizeBytes += size;
+          hashingTransform(hash, {
+            maxBytes: config.maxUploadBytes,
+            countBytes: (size) => {
+              sizeBytes += size;
+              return sizeBytes;
+            },
           }),
           createWriteStream(temporaryPath, { flags: "wx" }),
         );
@@ -323,9 +430,17 @@ export function registerImageRoutes(
         const sha256 = hash.digest("hex");
         computedSha256 = sha256;
         const duplicate = database
-          .prepare("SELECT id FROM images WHERE sha256 = ? AND deleted_at IS NULL")
-          .get(sha256) as unknown as { id: string } | undefined;
+          .prepare("SELECT id, deleted_at FROM images WHERE sha256 = ?")
+          .get(sha256) as unknown as { id: string; deleted_at: string | null } | undefined;
         if (duplicate) {
+          if (duplicate.deleted_at !== null) {
+            const deleteStatus = immediateTransaction(database, () =>
+              ensureDeleteJobQueuedForDeletedDuplicate(database, config, duplicate.id),
+            );
+            return reply
+              .code(409)
+              .send({ status: "error", code: deleteStatus === "requeued" ? "IMAGE_DELETE_REQUEUED" : "IMAGE_DELETE_PENDING" });
+          }
           const existingImage = getImage(database, duplicate.id);
           if (!existingImage) throw new Error("Duplicate image record disappeared");
           return reply.code(200).send({
@@ -341,12 +456,14 @@ export function registerImageRoutes(
           `${sha256}.${detected.extension}`,
         );
         storedFilePath(directories.root, relativePath);
+        const originalS3Location = s3LocationForStoredPath(config, storageDriver, relativePath);
         await storage.storeFile({
           storageDriver,
           accessMode,
           path: relativePath,
           sourcePath: temporaryPath,
           contentType: detected.mime,
+          s3: originalS3Location,
           move: storageDriver === "local",
         });
         storedNewMedia = {
@@ -354,6 +471,7 @@ export function registerImageRoutes(
           accessMode,
           path: relativePath,
           contentType: detected.mime,
+          s3: originalS3Location,
         };
 
         const imageId = ulid();
@@ -367,8 +485,9 @@ export function registerImageRoutes(
               `INSERT INTO images
                 (id, sha256, original_name, original_mime, original_ext, original_path,
                  width, height, size_bytes, has_alpha, is_animated, status, storage_driver, access_mode,
+                 s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style,
                  created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               imageId,
@@ -385,6 +504,7 @@ export function registerImageRoutes(
               imageStatus,
               storageDriver,
               accessMode,
+              ...s3LocationValues(originalS3Location),
               now,
               now,
             );
@@ -399,13 +519,16 @@ export function registerImageRoutes(
                   sha256,
                   `${profile}.${format}`,
                 );
+                const variantS3Location = s3LocationForStoredPath(config, storageDriver, variantPath);
                 database
                   .prepare(
                     `INSERT INTO variants
-                      (id, image_id, profile, format, path, status, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
+                      (id, image_id, profile, format, path, status,
+                       s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style,
+                       created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
                   )
-                  .run(ulid(), imageId, profile, format, variantPath, now, now);
+                  .run(ulid(), imageId, profile, format, variantPath, ...s3LocationValues(variantS3Location), now, now);
               }
             }
             database
@@ -445,6 +568,9 @@ export function registerImageRoutes(
             }
           }
         }
+        if (error instanceof UploadTooLargeError) {
+          return reply.code(413).send({ status: "error", code: "FILE_TOO_LARGE" });
+        }
         throw error;
       } finally {
         await unlink(temporaryPath).catch(() => undefined);
@@ -460,6 +586,7 @@ export function registerImageRoutes(
         .prepare(
           `SELECT id, sha256, original_name, original_mime, original_path, width, height,
                   size_bytes, has_alpha, is_animated, status, storage_driver, access_mode,
+                  s3_bucket, s3_object_key, s3_endpoint, s3_region, s3_public_base_url, s3_force_path_style,
                   created_at, updated_at
            FROM images WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 100`,
         )
@@ -516,18 +643,67 @@ export function registerImageRoutes(
         return reply.code(409).send({ status: "error", code: "IMAGE_BUSY" });
       }
       const variants = database
-        .prepare("SELECT path FROM variants WHERE image_id = ?")
-        .all(image.id) as unknown as Array<{ path: string }>;
-      const medias = [image.original_path, ...variants.map((variant) => variant.path)].map((path) => ({
-        storageDriver: image.storage_driver,
-        accessMode: image.access_mode,
-        path,
-      }));
+        .prepare(
+          `SELECT path, s3_bucket, s3_object_key, s3_endpoint, s3_region,
+                  s3_public_base_url, s3_force_path_style
+           FROM variants WHERE image_id = ?`,
+        )
+        .all(image.id) as unknown as Array<{ path: string } & StoredS3LocationColumns>;
+      const mediaToDelete: StoredMedia[] = [
+        {
+          storageDriver: image.storage_driver,
+          accessMode: image.access_mode,
+          path: image.original_path,
+          contentType: image.original_mime,
+          s3: s3LocationFromColumns(image),
+        },
+        ...variants.map((variant) => ({
+          storageDriver: image.storage_driver,
+          accessMode: image.access_mode,
+          path: variant.path,
+          s3: s3LocationFromColumns(variant),
+        })),
+      ];
+      let deleteJobId = "";
       immediateTransaction(database, () => {
-        database.prepare("DELETE FROM images WHERE id = ?").run(image.id);
+        const now = new Date().toISOString();
+        deleteJobId = ulid();
+        database
+          .prepare("UPDATE images SET deleted_at = ?, updated_at = ? WHERE id = ?")
+          .run(now, now, image.id);
+        database
+          .prepare(
+            `UPDATE jobs SET state = 'failed', lease_until = NULL, worker_id = NULL,
+               last_error = 'Image deleted before processing', updated_at = ?
+             WHERE image_id = ? AND type = 'generate_variants' AND state != 'succeeded'`,
+          )
+          .run(now, image.id);
+        database
+          .prepare(
+            `INSERT INTO jobs
+              (id, type, image_id, state, attempts, available_at, created_at, updated_at)
+             VALUES (?, 'delete_files', ?, 'pending', 0, ?, ?, ?)`,
+          )
+          .run(deleteJobId, image.id, now, now, now);
       });
-      await Promise.all(medias.map((media) => storage.delete(media)));
-      return reply.code(204).send();
+
+      const failures = await deleteStoredMedia(storage, mediaToDelete, directories.root);
+      if (failures.length === 0) {
+        immediateTransaction(database, () => {
+          database.prepare("DELETE FROM jobs WHERE id = ?").run(deleteJobId);
+          database.prepare("DELETE FROM images WHERE id = ?").run(image.id);
+        });
+        return reply.code(204).send();
+      }
+
+      const now = new Date().toISOString();
+      database
+        .prepare(
+          `UPDATE jobs SET state = 'pending', available_at = ?, lease_until = NULL,
+             worker_id = NULL, last_error = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(now, failures.join("; ").slice(0, 2_000), now, deleteJobId);
+      return reply.code(202).send({ accepted: true, cleanup: "pending" });
     },
   );
 }

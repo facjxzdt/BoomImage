@@ -11,6 +11,7 @@ export interface AppConfig {
   migrationsDir: string;
   webDistDir: string;
   baseUrl: string;
+  appSecret: string;
   sessionTtlSeconds: number;
   authRateLimitWindowMs: number;
   authRateLimitMaxAttempts: number;
@@ -45,6 +46,8 @@ export interface S3Config {
   secretAccessKey?: string;
   sessionToken?: string;
 }
+
+const DEVELOPMENT_APP_SECRET = "development-secret-change-me-32-chars";
 
 function integerFromEnv(
   env: NodeJS.ProcessEnv,
@@ -107,6 +110,22 @@ function booleanFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: boolean)
   throw new Error(`${name} must be a boolean`);
 }
 
+function appSecretFromEnv(env: NodeJS.ProcessEnv): string {
+  const configuredValue = env.APP_SECRET && env.APP_SECRET.length > 0 ? env.APP_SECRET : undefined;
+  const value = configuredValue ?? DEVELOPMENT_APP_SECRET;
+  if (value.length < 32) {
+    throw new Error("APP_SECRET must be at least 32 characters");
+  }
+  if (env.NODE_ENV === "production" && (!configuredValue || isInsecureAppSecret(value))) {
+    throw new Error("APP_SECRET must be set to a unique random secret in production");
+  }
+  return value;
+}
+
+function isInsecureAppSecret(value: string): boolean {
+  return value === DEVELOPMENT_APP_SECRET || value.includes("change-me") || value.startsWith("replace-with-");
+}
+
 function normalizeS3Prefix(value: string | undefined): string {
   if (!value) return "";
   return value.replace(/^\/+|\/+$/g, "");
@@ -159,6 +178,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     migrationsDir: resolve(env.MIGRATIONS_DIR ?? resolve(projectRoot, "migrations")),
     webDistDir: resolve(env.WEB_DIST_DIR ?? resolve(projectRoot, "apps/web/dist")),
     baseUrl: (env.APP_BASE_URL ?? "http://localhost:3000").replace(/\/$/, ""),
+    appSecret: appSecretFromEnv(env),
     sessionTtlSeconds: integerFromEnv(env, "SESSION_TTL_SECONDS", 2_592_000, 300, 31_536_000),
     authRateLimitWindowMs: integerFromEnv(
       env,

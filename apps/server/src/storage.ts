@@ -1,5 +1,6 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { access, copyFile, mkdir, rename, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
 import { basename, dirname, isAbsolute, posix, relative, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import {
@@ -20,11 +21,21 @@ export interface StoredMedia {
   accessMode: MediaAccessMode;
   path: string;
   contentType?: string;
+  s3?: StoredS3Location | undefined;
 }
 
 export interface StoreFileOptions extends StoredMedia {
   sourcePath: string;
   move?: boolean;
+}
+
+export interface StoredS3Location {
+  bucket: string;
+  objectKey: string;
+  endpoint?: string | undefined;
+  region: string;
+  publicBaseUrl?: string | undefined;
+  forcePathStyle: boolean;
 }
 
 export interface MediaStorage {
@@ -52,11 +63,15 @@ function pathInsideDirectory(directory: string, storedPath: string): string {
 
 async function pathExists(path: string): Promise<boolean> {
   try {
-    await access(path);
+    await access(path, constants.F_OK);
     return true;
   } catch {
     return false;
   }
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (error as { code?: unknown }).code === "ENOENT";
 }
 
 export function contentTypeForPath(path: string): string {
@@ -81,23 +96,47 @@ function validateStoredPath(storedPath: string): string {
   return normalizedPath;
 }
 
-function s3Key(config: AppConfig, storedPath: string): string {
-  const normalizedPath = validateStoredPath(storedPath);
-  return config.s3.prefix ? posix.join(config.s3.prefix, normalizedPath) : normalizedPath;
+export function s3ObjectKey(config: AppConfig, storedPath: string): string {
+  return s3ObjectKeyFromPrefix(config.s3.prefix, storedPath);
 }
 
-function s3PublicUrl(config: AppConfig, storedPath: string): string {
-  const key = s3Key(config, storedPath);
-  if (config.s3.publicBaseUrl) {
-    return `${config.s3.publicBaseUrl}/${encodedPath(key)}`;
+function s3ObjectKeyFromPrefix(prefix: string, storedPath: string): string {
+  const normalizedPath = validateStoredPath(storedPath);
+  return prefix ? posix.join(prefix, normalizedPath) : normalizedPath;
+}
+
+export function s3LocationFromConfig(s3: AppConfig["s3"], storedPath: string): StoredS3Location {
+  if (!s3.bucket) throw new Error("S3 storage is not configured");
+  return {
+    bucket: s3.bucket,
+    objectKey: s3ObjectKeyFromPrefix(s3.prefix, storedPath),
+    endpoint: s3.endpoint,
+    region: s3.region,
+    publicBaseUrl: s3.publicBaseUrl,
+    forcePathStyle: s3.forcePathStyle,
+  };
+}
+
+export function currentS3Location(config: AppConfig, storedPath: string): StoredS3Location {
+  return s3LocationFromConfig(config.s3, storedPath);
+}
+
+function s3Location(config: AppConfig, media: StoredMedia): StoredS3Location {
+  return media.s3 ?? currentS3Location(config, media.path);
+}
+
+function s3PublicUrl(config: AppConfig, media: StoredMedia): string {
+  const location = s3Location(config, media);
+  if (location.publicBaseUrl) {
+    return `${location.publicBaseUrl}/${encodedPath(location.objectKey)}`;
   }
-  if (config.s3.endpoint) {
-    const endpoint = config.s3.endpoint.replace(/\/$/, "");
-    return config.s3.forcePathStyle
-      ? `${endpoint}/${encodeURIComponent(config.s3.bucket)}/${encodedPath(key)}`
-      : `${endpoint}/${encodedPath(key)}`;
+  if (location.endpoint) {
+    const endpoint = location.endpoint.replace(/\/$/, "");
+    return location.forcePathStyle
+      ? `${endpoint}/${encodeURIComponent(location.bucket)}/${encodedPath(location.objectKey)}`
+      : `${endpoint}/${encodedPath(location.objectKey)}`;
   }
-  return `https://${config.s3.bucket}.s3.${config.s3.region}.amazonaws.com/${encodedPath(key)}`;
+  return `https://${location.bucket}.s3.${location.region}.amazonaws.com/${encodedPath(location.objectKey)}`;
 }
 
 export class LocalMediaStorage {
@@ -136,7 +175,11 @@ export class LocalMediaStorage {
   }
 
   async delete(media: StoredMedia): Promise<void> {
-    await unlink(pathInsideDirectory(this.#directories.root, media.path)).catch(() => undefined);
+    try {
+      await unlink(pathInsideDirectory(this.#directories.root, media.path));
+    } catch (error) {
+      if (!isNotFoundError(error)) throw error;
+    }
   }
 
   async sendProxy(media: StoredMedia, reply: FastifyReply): Promise<void> {
@@ -151,32 +194,66 @@ export class LocalMediaStorage {
 
 export class S3MediaStorage {
   readonly #config: AppConfig;
-  readonly #client: S3Client;
+  #client: S3Client;
+  #clientSignature = "";
 
   constructor(config: AppConfig, client?: S3Client) {
     this.#config = config;
-    if (!config.s3.bucket) throw new Error("S3_BUCKET is required for S3 storage");
-    const clientConfig: S3ClientConfig = {
+    const defaultLocation: StoredS3Location = {
+      bucket: config.s3.bucket,
+      objectKey: "healthcheck",
+      endpoint: config.s3.endpoint,
       region: config.s3.region,
+      publicBaseUrl: config.s3.publicBaseUrl,
       forcePathStyle: config.s3.forcePathStyle,
     };
-    if (config.s3.endpoint) clientConfig.endpoint = config.s3.endpoint;
-    if (config.s3.accessKeyId && config.s3.secretAccessKey) {
+    this.#client = client ?? this.#createClient(defaultLocation);
+    this.#clientSignature = this.#signature(defaultLocation);
+  }
+
+  #createClient(location: StoredS3Location): S3Client {
+    const clientConfig: S3ClientConfig = {
+      region: location.region,
+      forcePathStyle: location.forcePathStyle,
+    };
+    if (location.endpoint) clientConfig.endpoint = location.endpoint;
+    if (this.#config.s3.accessKeyId && this.#config.s3.secretAccessKey) {
       const credentials: { accessKeyId: string; secretAccessKey: string; sessionToken?: string } = {
-        accessKeyId: config.s3.accessKeyId,
-        secretAccessKey: config.s3.secretAccessKey,
+        accessKeyId: this.#config.s3.accessKeyId,
+        secretAccessKey: this.#config.s3.secretAccessKey,
       };
-      if (config.s3.sessionToken) credentials.sessionToken = config.s3.sessionToken;
+      if (this.#config.s3.sessionToken) credentials.sessionToken = this.#config.s3.sessionToken;
       clientConfig.credentials = credentials;
     }
-    this.#client = client ?? new S3Client(clientConfig);
+    return new S3Client(clientConfig);
+  }
+
+  #signature(location: StoredS3Location): string {
+    return JSON.stringify({
+      endpoint: location.endpoint ?? "",
+      region: location.region,
+      forcePathStyle: location.forcePathStyle,
+      accessKeyId: this.#config.s3.accessKeyId ?? "",
+      secretAccessKey: this.#config.s3.secretAccessKey ?? "",
+      sessionToken: this.#config.s3.sessionToken ?? "",
+    });
+  }
+
+  #clientFor(location: StoredS3Location): S3Client {
+    const signature = this.#signature(location);
+    if (this.#clientSignature !== signature) {
+      this.#client = this.#createClient(location);
+      this.#clientSignature = signature;
+    }
+    return this.#client;
   }
 
   async storeFile(options: StoreFileOptions): Promise<void> {
-    await this.#client.send(
+    const location = options.s3 ?? currentS3Location(this.#config, options.path);
+    await this.#clientFor(location).send(
       new PutObjectCommand({
-        Bucket: this.#config.s3.bucket,
-        Key: s3Key(this.#config, options.path),
+        Bucket: location.bucket,
+        Key: location.objectKey,
         Body: createReadStream(options.sourcePath),
         ContentType: options.contentType ?? contentTypeForPath(options.path),
         CacheControl: "public, max-age=31536000, immutable",
@@ -186,11 +263,12 @@ export class S3MediaStorage {
   }
 
   async materializeToLocal(media: StoredMedia, targetPath: string): Promise<void> {
+    const location = s3Location(this.#config, media);
     await mkdir(dirname(targetPath), { recursive: true });
-    const response = await this.#client.send(
+    const response = await this.#clientFor(location).send(
       new GetObjectCommand({
-        Bucket: this.#config.s3.bucket,
-        Key: s3Key(this.#config, media.path),
+        Bucket: location.bucket,
+        Key: location.objectKey,
       }),
     );
     if (!response.Body) throw new Error("S3 object response body is empty");
@@ -199,21 +277,21 @@ export class S3MediaStorage {
   }
 
   async delete(media: StoredMedia): Promise<void> {
-    await this.#client
-      .send(
-        new DeleteObjectCommand({
-          Bucket: this.#config.s3.bucket,
-          Key: s3Key(this.#config, media.path),
-        }),
-      )
-      .catch(() => undefined);
+    const location = s3Location(this.#config, media);
+    await this.#clientFor(location).send(
+      new DeleteObjectCommand({
+        Bucket: location.bucket,
+        Key: location.objectKey,
+      }),
+    );
   }
 
   async sendProxy(media: StoredMedia, reply: FastifyReply): Promise<void> {
-    const response = await this.#client.send(
+    const location = s3Location(this.#config, media);
+    const response = await this.#clientFor(location).send(
       new GetObjectCommand({
-        Bucket: this.#config.s3.bucket,
-        Key: s3Key(this.#config, media.path),
+        Bucket: location.bucket,
+        Key: location.objectKey,
       }),
     );
     if (!response.Body) {
@@ -262,7 +340,6 @@ export class RoutedMediaStorage implements MediaStorage {
   }
 
   #refreshS3(): S3MediaStorage {
-    if (!this.#config.s3.bucket) throw new Error("S3 storage is not configured");
     const signature = this.#currentS3Signature();
     if (!this.#s3 || this.#s3Signature !== signature) {
       this.#s3 = new S3MediaStorage(this.#config);
@@ -291,7 +368,7 @@ export class RoutedMediaStorage implements MediaStorage {
   publicUrl(media: StoredMedia): string {
     if (media.storageDriver === "s3" && media.accessMode === "direct") {
       this.#refreshS3();
-      return s3PublicUrl(this.#config, media.path);
+      return s3PublicUrl(this.#config, media);
     }
     if (media.storageDriver === "s3") {
       return `${this.#config.baseUrl}/media/proxy/${encodedPath(validateStoredPath(media.path))}`;
