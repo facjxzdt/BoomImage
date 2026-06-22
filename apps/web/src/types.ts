@@ -29,3 +29,27 @@ export interface ImageItem {
   originalUrl: string;
   variants: ImageVariant[];
 }
+
+export interface RuntimeSettings {
+  baseUrl: string;
+  maxUploadBytes: number;
+  maxInputPixels: number;
+  jobLeaseSeconds: number;
+  jobMaxAttempts: number;
+  avifQuality: number;
+  avifEffort: number;
+  webpQuality: number;
+  storageDriver: "local" | "s3";
+  storageAccessMode: "direct" | "proxy";
+  s3: {
+    endpoint: string;
+    region: string;
+    bucket: string;
+    prefix: string;
+    publicBaseUrl: string;
+    forcePathStyle: boolean;
+    accessKeyId: string;
+    secretAccessKeyConfigured: boolean;
+    sessionTokenConfigured: boolean;
+  };
+}

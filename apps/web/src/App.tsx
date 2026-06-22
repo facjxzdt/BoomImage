@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent } from "react";
 import { ApiError, api, uploadImage } from "./api";
-import type { ImageItem, ImageStatus } from "./types";
+import type { ImageItem, ImageStatus, RuntimeSettings } from "./types";
 
 type Screen = "loading" | "setup" | "login" | "gallery";
 
@@ -25,6 +25,8 @@ const errorMessages: Record<string, string> = {
   INVALID_CSRF_OR_SESSION: "会话已过期，请重新登录",
   IMAGE_BUSY: "图片仍在转换，请稍后再删除",
   NETWORK_ERROR: "无法连接到服务",
+  INVALID_SETTINGS: "设置无效，请检查必填项和取值范围",
+  S3_NOT_CONFIGURED: "S3 尚未配置完整",
 };
 
 const brandMarkClass =
@@ -392,6 +394,214 @@ function TokenPanel({ onClose }: { onClose: () => void }) {
   );
 }
 
+function numberInputValue(value: number): string {
+  return Number.isFinite(value) ? String(value) : "";
+}
+
+function SettingsPanel({ onClose }: { onClose: () => void }) {
+  const [settings, setSettings] = useState<RuntimeSettings | null>(null);
+  const [secretAccessKey, setSecretAccessKey] = useState("");
+  const [sessionToken, setSessionToken] = useState("");
+  const [clearSecretAccessKey, setClearSecretAccessKey] = useState(false);
+  const [clearSessionToken, setClearSessionToken] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setSettings((await api.settings()).settings);
+      setError("");
+    } catch (loadError) {
+      setError(friendlyError(loadError));
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    if (!saved) return;
+    const timer = window.setTimeout(() => setSaved(""), 2_000);
+    return () => window.clearTimeout(timer);
+  }, [saved]);
+
+  function update<K extends keyof RuntimeSettings>(key: K, value: RuntimeSettings[K]) {
+    setSettings((current) => current ? { ...current, [key]: value } : current);
+  }
+
+  function updateS3<K extends keyof RuntimeSettings["s3"]>(key: K, value: RuntimeSettings["s3"][K]) {
+    setSettings((current) => current ? { ...current, s3: { ...current.s3, [key]: value } } : current);
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!settings) return;
+    setSaving(true);
+    setError("");
+    try {
+      const payload = {
+        ...settings,
+        s3: {
+          ...settings.s3,
+          ...(secretAccessKey ? { secretAccessKey } : {}),
+          ...(clearSecretAccessKey ? { clearSecretAccessKey: true } : {}),
+          ...(sessionToken ? { sessionToken } : {}),
+          ...(clearSessionToken ? { clearSessionToken: true } : {}),
+        },
+      };
+      const response = await api.updateSettings(payload);
+      setSettings(response.settings);
+      setSecretAccessKey("");
+      setSessionToken("");
+      setClearSecretAccessKey(false);
+      setClearSessionToken(false);
+      setSaved("设置已保存");
+    } catch (saveError) {
+      setError(friendlyError(saveError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-900/30 p-5 backdrop-blur-[10px]" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="max-h-[min(860px,calc(100vh-40px))] w-full max-w-[860px] overflow-auto rounded-[28px] border border-slate-200/95 bg-white/95 p-7 shadow-[0_28px_80px_rgba(32,55,84,0.16)]" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div className="flex items-start justify-between gap-5">
+          <div>
+            <p className={eyebrowClass}>RUNTIME SETTINGS</p>
+            <h2 id="settings-title" className="m-0 text-2xl font-black tracking-tight text-slate-950">程序设置</h2>
+          </div>
+          <button className={quietButtonClass} type="button" onClick={onClose}>关闭</button>
+        </div>
+        <p className="mt-4 text-[13px] leading-relaxed text-slate-500">
+          这里保存到 SQLite，会覆盖 `.env` 中对应默认值。端口、数据目录、APP_SECRET 等启动级配置仍建议通过 `.env` 管理；反向代理上传上限改动后也要同步调整 Nginx/Caddy。
+        </p>
+        {!settings ? (
+          <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-5 text-sm text-slate-500">正在读取设置…</div>
+        ) : (
+          <form className="mt-6 grid gap-6" onSubmit={submit}>
+            <section className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+              <h3 className="text-sm font-black text-slate-950">基础与转换</h3>
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  公开访问地址
+                  <input className={inputClass} value={settings.baseUrl} onChange={(event) => update("baseUrl", event.target.value)} placeholder="https://img.example.com" required />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  最大上传字节
+                  <input className={inputClass} type="number" min={1} max={1_073_741_824} value={numberInputValue(settings.maxUploadBytes)} onChange={(event) => update("maxUploadBytes", Number(event.target.value))} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  最大解码像素
+                  <input className={inputClass} type="number" min={1} max={1_000_000_000} value={numberInputValue(settings.maxInputPixels)} onChange={(event) => update("maxInputPixels", Number(event.target.value))} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  任务租约秒数
+                  <input className={inputClass} type="number" min={30} max={3600} value={numberInputValue(settings.jobLeaseSeconds)} onChange={(event) => update("jobLeaseSeconds", Number(event.target.value))} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  最大重试次数
+                  <input className={inputClass} type="number" min={1} max={10} value={numberInputValue(settings.jobMaxAttempts)} onChange={(event) => update("jobMaxAttempts", Number(event.target.value))} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  AVIF 质量
+                  <input className={inputClass} type="number" min={1} max={100} value={numberInputValue(settings.avifQuality)} onChange={(event) => update("avifQuality", Number(event.target.value))} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  AVIF Effort
+                  <input className={inputClass} type="number" min={0} max={9} value={numberInputValue(settings.avifEffort)} onChange={(event) => update("avifEffort", Number(event.target.value))} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  WebP 质量
+                  <input className={inputClass} type="number" min={1} max={100} value={numberInputValue(settings.webpQuality)} onChange={(event) => update("webpQuality", Number(event.target.value))} />
+                </label>
+              </div>
+            </section>
+
+            <section className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+              <h3 className="text-sm font-black text-slate-950">默认存储</h3>
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  默认上传后端
+                  <select className={inputClass} value={settings.storageDriver} onChange={(event) => update("storageDriver", event.target.value as RuntimeSettings["storageDriver"])}>
+                    <option value="local">本地</option>
+                    <option value="s3">S3</option>
+                  </select>
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  默认 S3 访问方式
+                  <select className={inputClass} value={settings.storageAccessMode} onChange={(event) => update("storageAccessMode", event.target.value as RuntimeSettings["storageAccessMode"])}>
+                    <option value="direct">S3/CDN 直链</option>
+                    <option value="proxy">服务器代理</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+
+            <section className="grid gap-4 rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+              <h3 className="text-sm font-black text-slate-950">S3 兼容存储</h3>
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  Endpoint
+                  <input className={inputClass} value={settings.s3.endpoint} onChange={(event) => updateS3("endpoint", event.target.value)} placeholder="https://xxx.r2.cloudflarestorage.com" />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  Region
+                  <input className={inputClass} value={settings.s3.region} onChange={(event) => updateS3("region", event.target.value)} placeholder="auto" />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  Bucket
+                  <input className={inputClass} value={settings.s3.bucket} onChange={(event) => updateS3("bucket", event.target.value)} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  Prefix
+                  <input className={inputClass} value={settings.s3.prefix} onChange={(event) => updateS3("prefix", event.target.value)} placeholder="boomimage" />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700 md:col-span-2">
+                  直链公开基址 / CDN
+                  <input className={inputClass} value={settings.s3.publicBaseUrl} onChange={(event) => updateS3("publicBaseUrl", event.target.value)} placeholder="https://cdn.example.com" />
+                </label>
+                <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-[13px] font-bold text-slate-700">
+                  <input type="checkbox" checked={settings.s3.forcePathStyle} onChange={(event) => updateS3("forcePathStyle", event.target.checked)} />
+                  使用 path-style 访问
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  Access Key ID
+                  <input className={inputClass} value={settings.s3.accessKeyId} onChange={(event) => updateS3("accessKeyId", event.target.value)} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  Secret Access Key
+                  <input className={inputClass} type="password" value={secretAccessKey} onChange={(event) => { setSecretAccessKey(event.target.value); setClearSecretAccessKey(false); }} placeholder={settings.s3.secretAccessKeyConfigured ? "已保存，留空则不修改" : "未配置"} />
+                </label>
+                <label className="grid gap-2 text-[13px] font-bold text-slate-700">
+                  Session Token
+                  <input className={inputClass} type="password" value={sessionToken} onChange={(event) => { setSessionToken(event.target.value); setClearSessionToken(false); }} placeholder={settings.s3.sessionTokenConfigured ? "已保存，留空则不修改" : "可选"} />
+                </label>
+              </div>
+              <div className="flex flex-wrap gap-3 text-xs text-slate-500">
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={clearSecretAccessKey} onChange={(event) => { setClearSecretAccessKey(event.target.checked); if (event.target.checked) setSecretAccessKey(""); }} />
+                  清空 Secret Access Key
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={clearSessionToken} onChange={(event) => { setClearSessionToken(event.target.checked); if (event.target.checked) setSessionToken(""); }} />
+                  清空 Session Token
+                </label>
+              </div>
+            </section>
+
+            {error && <p className={dangerTextClass} role="alert">{error}</p>}
+            {saved && <p className="text-[13px] font-bold text-green-600">{saved}</p>}
+            <div className="flex justify-end gap-2">
+              <button className={quietButtonClass} type="button" onClick={() => void load()}>重新读取</button>
+              <button className={primaryButtonClass} disabled={saving}>{saving ? "保存中…" : "保存设置"}</button>
+            </div>
+          </form>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function Gallery({ onLogout }: { onLogout: () => void }) {
   const [images, setImages] = useState<ImageItem[]>([]);
   const [uploads, setUploads] = useState<UploadEntry[]>([]);
@@ -399,6 +609,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const [tokensOpen, setTokensOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [uploadStorage, setUploadStorage] = useState<UploadStorageDriver>("local");
   const [uploadAccess, setUploadAccess] = useState<UploadAccessMode>("direct");
   const readyCount = images.filter((image) => image.status === "ready").length;
@@ -504,6 +715,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
           <span className="mr-1.5 inline-block h-2 w-2 rounded-full bg-green-600 shadow-[0_0_0_4px_rgba(22,163,74,0.12)]" /> 本地服务正常
         </div>
         <div className="flex gap-2">
+          <button className={quietButtonClass} type="button" onClick={() => setSettingsOpen(true)}>设置</button>
           <button className={quietButtonClass} type="button" onClick={() => setTokensOpen(true)}>API Token</button>
           <button className={ghostButtonClass} type="button" onClick={onLogout}>退出</button>
         </div>
@@ -603,6 +815,7 @@ function Gallery({ onLogout }: { onLogout: () => void }) {
         )}
       </main>
       {toast && <div className="fixed bottom-8 left-1/2 z-30 -translate-x-1/2 rounded-full border border-blue-200 bg-white/95 px-4 py-2.5 text-xs font-black text-blue-800 shadow-[0_16px_40px_rgba(32,55,84,0.10)]" role="status">✓ {toast}</div>}
+      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
       {tokensOpen && <TokenPanel onClose={() => setTokensOpen(false)} />}
     </div>
   );

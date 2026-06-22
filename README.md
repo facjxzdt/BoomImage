@@ -202,6 +202,15 @@ STORAGE_DRIVER=local
 
 通常不需要修改 `APP_HOST`、`APP_PORT`、`APP_DATA_DIR` 和 `WEB_DIST_DIR`。在 Docker 部署里它们已经和 `compose.yaml` 对齐。
 
+完成首次初始化后，管理界面右上角的“设置”可以修改大部分日常运行参数，并保存到 SQLite 覆盖 `.env` 默认值，包括：
+
+- `APP_BASE_URL`
+- 上传大小、解码像素、转换质量和任务重试参数
+- 默认上传存储后端和 S3 访问方式
+- S3 Endpoint、Region、Bucket、Prefix、CDN 公开基址和访问密钥
+
+`.env` 仍建议只管理启动级或底座配置，例如 `BOOMIMAGE_IMAGE`、`APP_ADDRESS`、`APP_SECRET`、`APP_HOST`、`APP_PORT`、`APP_DATA_DIR`、`WEB_DIST_DIR`。如果在 UI 中调大上传上限，也要同步调大 Nginx 的 `client_max_body_size` 或其他前置代理限制。
+
 生成 APP_SECRET：
 
 ~~~bash
@@ -419,6 +428,8 @@ https://img.example.com
 - 保存到密码管理器。
 
 ## 8. 验证上传和静态读取
+
+登录后可以先打开右上角“设置”，确认公开访问地址、默认存储策略和 S3 参数是否正确。Secret Access Key 和 Session Token 只显示“是否已配置”，不会回显明文；留空表示不修改，勾选清空才会删除。
 
 登录管理界面后上传一张图片。上传区上方可以选择存储策略：
 

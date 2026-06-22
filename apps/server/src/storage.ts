@@ -234,18 +234,46 @@ export class S3MediaStorage {
 export class RoutedMediaStorage implements MediaStorage {
   readonly #config: AppConfig;
   readonly #local: LocalMediaStorage;
-  readonly #s3: S3MediaStorage | undefined;
+  #s3: S3MediaStorage | undefined;
+  #s3Signature = "";
 
   constructor(config: AppConfig, directories: DataDirectories, s3?: S3MediaStorage) {
     this.#config = config;
     this.#local = new LocalMediaStorage(directories);
-    this.#s3 = s3 ?? (config.s3.bucket ? new S3MediaStorage(config) : undefined);
+    if (s3) {
+      this.#s3 = s3;
+      this.#s3Signature = this.#currentS3Signature();
+    } else if (config.s3.bucket) {
+      this.#refreshS3();
+    }
+  }
+
+  #currentS3Signature(): string {
+    return JSON.stringify({
+      endpoint: this.#config.s3.endpoint ?? "",
+      region: this.#config.s3.region,
+      bucket: this.#config.s3.bucket,
+      prefix: this.#config.s3.prefix,
+      forcePathStyle: this.#config.s3.forcePathStyle,
+      accessKeyId: this.#config.s3.accessKeyId ?? "",
+      secretAccessKey: this.#config.s3.secretAccessKey ?? "",
+      sessionToken: this.#config.s3.sessionToken ?? "",
+    });
+  }
+
+  #refreshS3(): S3MediaStorage {
+    if (!this.#config.s3.bucket) throw new Error("S3 storage is not configured");
+    const signature = this.#currentS3Signature();
+    if (!this.#s3 || this.#s3Signature !== signature) {
+      this.#s3 = new S3MediaStorage(this.#config);
+      this.#s3Signature = signature;
+    }
+    return this.#s3;
   }
 
   #backend(driver: StorageDriver): LocalMediaStorage | S3MediaStorage {
     if (driver === "local") return this.#local;
-    if (!this.#s3) throw new Error("S3 storage is not configured");
-    return this.#s3;
+    return this.#refreshS3();
   }
 
   async storeFile(options: StoreFileOptions): Promise<void> {
@@ -262,7 +290,7 @@ export class RoutedMediaStorage implements MediaStorage {
 
   publicUrl(media: StoredMedia): string {
     if (media.storageDriver === "s3" && media.accessMode === "direct") {
-      if (!this.#s3) throw new Error("S3 storage is not configured");
+      this.#refreshS3();
       return s3PublicUrl(this.#config, media.path);
     }
     if (media.storageDriver === "s3") {

@@ -44,12 +44,10 @@ function contentSecurityPolicy(config: AppConfig): string {
 }
 
 export function registerSecurityHeaders(app: FastifyInstance, config: AppConfig): void {
-  const csp = contentSecurityPolicy(config);
-
   app.addHook("onRequest", async (request, reply) => {
     const isPublicMediaRequest = request.url.startsWith("/media/");
 
-    reply.header("Content-Security-Policy", csp);
+    reply.header("Content-Security-Policy", contentSecurityPolicy(config));
     reply.header("Cross-Origin-Resource-Policy", isPublicMediaRequest ? "cross-origin" : "same-origin");
     reply.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     reply.header("Referrer-Policy", "no-referrer");

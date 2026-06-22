@@ -14,6 +14,12 @@ import {
 } from "./filesystem.js";
 import { registerImageRoutes } from "./images.js";
 import { registerSecurityHeaders } from "./security.js";
+import {
+  applyStoredRuntimeSettings,
+  cloneAppConfig,
+  MAX_UPLOAD_BYTES_HARD_LIMIT,
+  registerSettingsRoutes,
+} from "./settings.js";
 import { createMediaStorage, type MediaStorage } from "./storage.js";
 import { ImageWorker } from "./worker.js";
 
@@ -26,10 +32,12 @@ export interface BuildAppOptions {
 }
 
 export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
-  const config = options.config ?? loadConfig();
+  const baseConfig = cloneAppConfig(options.config ?? loadConfig());
+  const config = cloneAppConfig(baseConfig);
   const directories = await prepareDataDirectories(config.dataDir);
-  const storage = options.storage ?? createMediaStorage(config, directories);
   const database = await openDatabase(config.databasePath, config.migrationsDir);
+  applyStoredRuntimeSettings(database, config, baseConfig);
+  const storage = options.storage ?? createMediaStorage(config, directories);
 
   const app = Fastify({
     logger: options.logger === false ? false : { level: config.logLevel },
@@ -45,7 +53,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       files: 1,
       fields: 5,
       parts: 6,
-      fileSize: config.maxUploadBytes,
+      fileSize: MAX_UPLOAD_BYTES_HARD_LIMIT,
     },
   });
 
@@ -106,6 +114,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
 
   registerAuthRoutes(app, database, config);
+  registerSettingsRoutes(app, database, config, baseConfig);
   registerImageRoutes(app, database, config, directories, storage);
 
   let temporaryCleanupTimer: NodeJS.Timeout | undefined;

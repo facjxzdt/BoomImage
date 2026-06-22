@@ -1,4 +1,4 @@
-import type { ImageItem } from "./types";
+import type { ImageItem, RuntimeSettings } from "./types";
 
 interface ApiErrorBody {
   code?: string;
@@ -58,6 +58,20 @@ export const api = {
       headers: { "x-csrf-token": csrfToken() },
     }),
   images: () => jsonRequest<{ items: ImageItem[] }>("/api/v1/images"),
+  settings: () => jsonRequest<{ settings: RuntimeSettings }>("/api/v1/settings"),
+  updateSettings: (settings: Partial<RuntimeSettings> & {
+    s3?: Partial<RuntimeSettings["s3"]> & {
+      secretAccessKey?: string;
+      clearSecretAccessKey?: boolean;
+      sessionToken?: string;
+      clearSessionToken?: boolean;
+    };
+  }) =>
+    jsonRequest<{ settings: RuntimeSettings }>("/api/v1/settings", {
+      method: "PUT",
+      headers: { "x-csrf-token": csrfToken() },
+      body: JSON.stringify(settings),
+    }),
   retryImage: (id: string) =>
     jsonRequest<{ accepted: true }>(`/api/v1/images/${encodeURIComponent(id)}/retry`, {
       method: "POST",

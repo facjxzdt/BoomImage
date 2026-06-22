@@ -280,6 +280,9 @@ export function registerImageRoutes(
         if (part.file.truncated) {
           return reply.code(413).send({ status: "error", code: "FILE_TOO_LARGE" });
         }
+        if (sizeBytes > config.maxUploadBytes) {
+          return reply.code(413).send({ status: "error", code: "FILE_TOO_LARGE" });
+        }
 
         const fileHeader = Buffer.alloc(32);
         const temporaryFile = await open(temporaryPath, "r");
