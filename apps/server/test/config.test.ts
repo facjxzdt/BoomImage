@@ -30,4 +30,30 @@ describe("configuration", () => {
     expect(config.tmpFileTtlSeconds).toBe(7_200);
     expect(config.tmpCleanupIntervalSeconds).toBe(0);
   });
+
+  it("loads S3 storage settings", () => {
+    const config = loadConfig({
+      STORAGE_DRIVER: "s3",
+      S3_BUCKET: "boomimage",
+      S3_ENDPOINT: "https://s3.example.test",
+      S3_REGION: "auto",
+      S3_PREFIX: "/uploads/",
+      S3_PUBLIC_BASE_URL: "https://cdn.example.test/",
+      S3_FORCE_PATH_STYLE: "true",
+    });
+
+    expect(config.storageDriver).toBe("s3");
+    expect(config.s3).toMatchObject({
+      bucket: "boomimage",
+      endpoint: "https://s3.example.test",
+      region: "auto",
+      prefix: "uploads",
+      publicBaseUrl: "https://cdn.example.test",
+      forcePathStyle: true,
+    });
+  });
+
+  it("requires a bucket when S3 is the default storage driver", () => {
+    expect(() => loadConfig({ STORAGE_DRIVER: "s3" })).toThrow(/S3_BUCKET/);
+  });
 });

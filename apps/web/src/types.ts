@@ -22,9 +22,10 @@ export interface ImageItem {
   hasAlpha: boolean;
   isAnimated: boolean;
   status: ImageStatus;
+  storageDriver: "local" | "s3";
+  accessMode: "direct" | "proxy";
   createdAt: string;
   updatedAt: string;
   originalUrl: string;
   variants: ImageVariant[];
 }
-

@@ -5,6 +5,7 @@ import sharp, { type OutputInfo } from "sharp";
 import type { AppConfig } from "./config.js";
 import { immediateTransaction, type AppDatabase } from "./database.js";
 import type { DataDirectories } from "./filesystem.js";
+import type { MediaAccessMode, MediaStorage } from "./storage.js";
 
 interface ClaimedJob {
   id: string;
@@ -14,6 +15,9 @@ interface ClaimedJob {
 
 interface ImageSourceRow {
   original_path: string;
+  storage_driver: "local" | "s3";
+  access_mode: MediaAccessMode;
+  original_mime: string;
 }
 
 interface VariantJobRow {
@@ -33,6 +37,7 @@ export interface ImageWorkerOptions {
   database: AppDatabase;
   config: AppConfig;
   directories: DataDirectories;
+  storage: MediaStorage;
   logger: WorkerLogger;
 }
 
@@ -60,6 +65,7 @@ export class ImageWorker {
   readonly #database: AppDatabase;
   readonly #config: AppConfig;
   readonly #directories: DataDirectories;
+  readonly #storage: MediaStorage;
   readonly #logger: WorkerLogger;
   readonly #workerPrefix = `worker-${process.pid}`;
   #stopping = false;
@@ -69,6 +75,7 @@ export class ImageWorker {
     this.#database = options.database;
     this.#config = options.config;
     this.#directories = options.directories;
+    this.#storage = options.storage;
     this.#logger = options.logger;
     sharp.concurrency(Math.max(1, Math.floor(availableParallelism() / this.#config.imageWorkers)));
   }
@@ -147,7 +154,7 @@ export class ImageWorker {
 
   async #processClaimedJob(job: ClaimedJob): Promise<void> {
     const image = this.#database
-      .prepare("SELECT original_path FROM images WHERE id = ? AND deleted_at IS NULL")
+      .prepare("SELECT original_path, original_mime, storage_driver, access_mode FROM images WHERE id = ? AND deleted_at IS NULL")
       .get(job.imageId) as unknown as ImageSourceRow | undefined;
     if (!image) {
       this.#finishMissingImage(job);
@@ -161,16 +168,30 @@ export class ImageWorker {
          ORDER BY profile, format`,
       )
       .all(job.imageId) as unknown as VariantJobRow[];
-    const sourcePath = pathWithin(this.#directories.root, image.original_path);
+    const sourcePath = join(this.#directories.temporary, `${job.imageId}-${job.id}-source`);
     const failures: Array<{ variant: VariantJobRow; error: string }> = [];
 
-    for (const variant of variants) {
-      try {
-        const info = await this.#renderVariant(sourcePath, variant, job.id);
-        this.#markVariantReady(variant.id, info);
-      } catch (error) {
-        failures.push({ variant, error: errorMessage(error, this.#directories.root) });
+    try {
+      await unlink(sourcePath).catch(() => undefined);
+      await this.#storage.materializeToLocal({
+        storageDriver: image.storage_driver,
+        accessMode: image.access_mode,
+        path: image.original_path,
+        contentType: image.original_mime,
+      }, sourcePath);
+      for (const variant of variants) {
+        try {
+          const info = await this.#renderVariant(sourcePath, variant, image, job.id);
+          this.#markVariantReady(variant.id, info);
+        } catch (error) {
+          failures.push({ variant, error: errorMessage(error, this.#directories.root) });
+        }
       }
+    } catch (error) {
+      const message = errorMessage(error, this.#directories.root);
+      failures.push(...variants.map((variant) => ({ variant, error: message })));
+    } finally {
+      await unlink(sourcePath).catch(() => undefined);
     }
 
     if (failures.length === 0) {
@@ -185,6 +206,7 @@ export class ImageWorker {
   async #renderVariant(
     sourcePath: string,
     variant: VariantJobRow,
+    image: ImageSourceRow,
     jobId: string,
   ): Promise<OutputInfo> {
     const targetPath = pathWithin(this.#directories.root, variant.path);
@@ -206,8 +228,20 @@ export class ImageWorker {
 
     try {
       const info = await conversion.toFile(temporaryPath);
-      await unlink(targetPath).catch(() => undefined);
-      await rename(temporaryPath, targetPath);
+      if (image.storage_driver === "local") {
+        await unlink(targetPath).catch(() => undefined);
+        await mkdir(dirname(targetPath), { recursive: true });
+        await rename(temporaryPath, targetPath);
+      } else {
+        await this.#storage.storeFile({
+          storageDriver: image.storage_driver,
+          accessMode: image.access_mode,
+          path: variant.path,
+          sourcePath: temporaryPath,
+          contentType: `image/${variant.format}`,
+          move: true,
+        });
+      }
       return info;
     } catch (error) {
       await unlink(temporaryPath).catch(() => undefined);

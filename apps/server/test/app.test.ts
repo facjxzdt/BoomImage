@@ -55,6 +55,8 @@ describe("BoomImage application", () => {
     const response = await app.inject({ method: "GET", url: "/health/live" });
 
     expect(response.headers["content-security-policy"]).toContain("default-src 'self'");
+    expect(response.headers["content-security-policy"]).toContain("img-src 'self' data: blob:");
+    expect(response.headers["cross-origin-resource-policy"]).toBe("same-origin");
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
     expect(response.headers["x-frame-options"]).toBe("DENY");
     expect(response.headers["referrer-policy"]).toBe("no-referrer");
@@ -67,6 +69,28 @@ describe("BoomImage application", () => {
     const response = await app.inject({ method: "GET", url: "/health/live" });
 
     expect(response.headers["strict-transport-security"]).toContain("max-age=31536000");
+    await app.close();
+  });
+
+  it("allows configured S3 direct image origins in CSP", async () => {
+    const config = await testConfig();
+    config.s3.bucket = "boomimage-test";
+    config.s3.region = "auto";
+    config.s3.endpoint = "https://s3.example.test";
+    config.s3.publicBaseUrl = "https://cdn.example.test";
+    const app = await buildApp({ config, logger: false });
+    const response = await app.inject({ method: "GET", url: "/health/live" });
+
+    expect(response.headers["content-security-policy"]).toContain("https://cdn.example.test");
+    expect(response.headers["content-security-policy"]).toContain("https://s3.example.test");
+    await app.close();
+  });
+
+  it("allows public media to be embedded cross-origin", async () => {
+    const app = await buildApp({ config: await testConfig(), logger: false });
+    const response = await app.inject({ method: "GET", url: "/media/proxy/not-found.webp" });
+
+    expect(response.headers["cross-origin-resource-policy"]).toBe("cross-origin");
     await app.close();
   });
 

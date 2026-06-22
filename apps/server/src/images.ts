@@ -1,7 +1,7 @@
 import { createHash, randomUUID, type Hash } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { access, mkdir, open, rename, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
+import { mkdir, open, unlink } from "node:fs/promises";
+import { basename, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { FastifyInstance } from "fastify";
@@ -11,6 +11,7 @@ import { requireAuthentication } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { immediateTransaction, type AppDatabase } from "./database.js";
 import type { DataDirectories } from "./filesystem.js";
+import type { MediaAccessMode, MediaStorage, StoredMedia } from "./storage.js";
 
 interface DetectedImageType {
   extension: "jpg" | "png" | "webp" | "gif" | "avif";
@@ -29,6 +30,8 @@ interface ImageRow {
   has_alpha: number;
   is_animated: number;
   status: string;
+  storage_driver: "local" | "s3";
+  access_mode: MediaAccessMode;
   created_at: string;
   updated_at: string;
 }
@@ -82,19 +85,6 @@ function cleanOriginalName(filename: string): string {
   return (cleaned || "image").slice(0, 255);
 }
 
-async function exists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function publicUrl(config: AppConfig, relativePath: string): string {
-  return `${config.baseUrl}/media/${relativePath.split("\\").join("/")}`;
-}
-
 function storedFilePath(root: string, storedPath: string): string {
   if (isAbsolute(storedPath)) throw new Error("Stored media path must be relative");
   const resolvedRoot = resolve(root);
@@ -110,13 +100,14 @@ function getImage(database: AppDatabase, id: string): ImageRow | undefined {
   return database
     .prepare(
       `SELECT id, sha256, original_name, original_mime, original_path, width, height,
-              size_bytes, has_alpha, is_animated, status, created_at, updated_at
+              size_bytes, has_alpha, is_animated, status, storage_driver, access_mode,
+              created_at, updated_at
        FROM images WHERE id = ? AND deleted_at IS NULL`,
     )
     .get(id) as unknown as ImageRow | undefined;
 }
 
-function serializeImage(database: AppDatabase, config: AppConfig, image: ImageRow) {
+function serializeImage(database: AppDatabase, storage: MediaStorage, image: ImageRow) {
   const variants = database
     .prepare(
       `SELECT profile, format, path, width, height, size_bytes, status, error
@@ -135,9 +126,16 @@ function serializeImage(database: AppDatabase, config: AppConfig, image: ImageRo
     hasAlpha: image.has_alpha === 1,
     isAnimated: image.is_animated === 1,
     status: image.status,
+    storageDriver: image.storage_driver,
+    accessMode: image.access_mode,
     createdAt: image.created_at,
     updatedAt: image.updated_at,
-    originalUrl: publicUrl(config, image.original_path),
+    originalUrl: storage.publicUrl({
+      storageDriver: image.storage_driver,
+      accessMode: image.access_mode,
+      path: image.original_path,
+      contentType: image.original_mime,
+    }),
     variants: variants.map((variant) => ({
       profile: variant.profile,
       format: variant.format,
@@ -146,9 +144,42 @@ function serializeImage(database: AppDatabase, config: AppConfig, image: ImageRo
       sizeBytes: variant.size_bytes,
       status: variant.status,
       error: variant.error,
-      url: variant.status === "ready" ? publicUrl(config, variant.path) : null,
+      url: variant.status === "ready"
+        ? storage.publicUrl({
+          storageDriver: image.storage_driver,
+          accessMode: image.access_mode,
+          path: variant.path,
+        })
+        : null,
     })),
   };
+}
+
+function parseStorageField(value: unknown, fallback: "local" | "s3"): "local" | "s3" {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === "local" || value === "s3") return value;
+  throw new Error("INVALID_STORAGE_DRIVER");
+}
+
+function parseAccessField(value: unknown, fallback: MediaAccessMode): MediaAccessMode {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === "direct" || value === "proxy") return value;
+  throw new Error("INVALID_ACCESS_MODE");
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  const sqliteError = error as { code?: unknown; message?: unknown };
+  return sqliteError.code === "ERR_SQLITE_ERROR"
+    && typeof sqliteError.message === "string"
+    && sqliteError.message.includes("UNIQUE constraint failed");
+}
+
+function normalizeMediaPath(path: string): string {
+  const normalized = path.split("\\").join("/");
+  if (!normalized || normalized.startsWith("/") || normalized.includes("/../") || normalized.startsWith("../")) {
+    throw new Error("Invalid media path");
+  }
+  return normalized;
 }
 
 export function registerImageRoutes(
@@ -156,7 +187,56 @@ export function registerImageRoutes(
   database: AppDatabase,
   config: AppConfig,
   directories: DataDirectories,
+  storage: MediaStorage,
 ): void {
+  app.get<{ Params: { "*": string } }>(
+    "/media/proxy/*",
+    async (request, reply) => {
+      let mediaPath: string;
+      try {
+        mediaPath = normalizeMediaPath(request.params["*"]);
+      } catch {
+        return reply.code(404).send({ status: "error", code: "MEDIA_NOT_FOUND" });
+      }
+      const image = database
+        .prepare(
+          `SELECT original_mime, storage_driver, access_mode, original_path
+           FROM images WHERE original_path = ? AND deleted_at IS NULL`,
+        )
+        .get(mediaPath) as unknown as
+        | { original_mime: string; storage_driver: "local" | "s3"; access_mode: MediaAccessMode; original_path: string }
+        | undefined;
+      const variant = image
+        ? undefined
+        : database
+          .prepare(
+            `SELECT i.storage_driver, i.access_mode, v.path
+             FROM variants v
+             JOIN images i ON i.id = v.image_id
+             WHERE v.path = ? AND v.status = 'ready' AND i.deleted_at IS NULL`,
+          )
+          .get(mediaPath) as unknown as
+          | { storage_driver: "local" | "s3"; access_mode: MediaAccessMode; path: string }
+          | undefined;
+      const media = image
+        ? {
+          storageDriver: image.storage_driver,
+          accessMode: image.access_mode,
+          path: image.original_path,
+          contentType: image.original_mime,
+        }
+        : variant
+          ? {
+            storageDriver: variant.storage_driver,
+            accessMode: variant.access_mode,
+            path: variant.path,
+          }
+          : undefined;
+      if (!media) return reply.code(404).send({ status: "error", code: "MEDIA_NOT_FOUND" });
+      return storage.sendProxy(media, reply);
+    },
+  );
+
   app.post(
     "/api/v1/images",
     { preHandler: requireAuthentication(database, { csrf: true }) },
@@ -171,10 +251,25 @@ export function registerImageRoutes(
       const temporaryPath = join(directories.temporary, `${randomUUID()}.upload`);
       const hash = createHash("sha256");
       let sizeBytes = 0;
-      let finalPath: string | undefined;
-      let movedNewFile = false;
+      let storedNewMedia: StoredMedia | undefined;
+      let computedSha256: string | undefined;
+      let storageDriver: "local" | "s3";
+      let accessMode: MediaAccessMode;
 
       try {
+        const fields = part.fields as Record<string, { value?: unknown } | undefined>;
+        try {
+          storageDriver = parseStorageField(fields.storage?.value, config.storageDriver);
+          accessMode = parseAccessField(fields.access?.value, config.storageAccessMode);
+        } catch (fieldError) {
+          const code = fieldError instanceof Error ? fieldError.message : "INVALID_STORAGE_OPTIONS";
+          return reply.code(400).send({ status: "error", code });
+        }
+        if (storageDriver === "s3" && !config.s3.bucket) {
+          return reply.code(400).send({ status: "error", code: "S3_NOT_CONFIGURED" });
+        }
+        if (storageDriver === "local") accessMode = "direct";
+
         await pipeline(
           part.file,
           hashingTransform(hash, (size) => {
@@ -223,6 +318,7 @@ export function registerImageRoutes(
         }
 
         const sha256 = hash.digest("hex");
+        computedSha256 = sha256;
         const duplicate = database
           .prepare("SELECT id FROM images WHERE sha256 = ? AND deleted_at IS NULL")
           .get(sha256) as unknown as { id: string } | undefined;
@@ -231,7 +327,7 @@ export function registerImageRoutes(
           if (!existingImage) throw new Error("Duplicate image record disappeared");
           return reply.code(200).send({
             duplicate: true,
-            image: serializeImage(database, config, existingImage),
+            image: serializeImage(database, storage, existingImage),
           });
         }
 
@@ -241,15 +337,21 @@ export function registerImageRoutes(
           sha256.slice(2, 4),
           `${sha256}.${detected.extension}`,
         );
-        finalPath = join(directories.root, ...relativePath.split("/"));
-        await mkdir(dirname(finalPath), { recursive: true });
-
-        if (await exists(finalPath)) {
-          await unlink(temporaryPath);
-        } else {
-          await rename(temporaryPath, finalPath);
-          movedNewFile = true;
-        }
+        storedFilePath(directories.root, relativePath);
+        await storage.storeFile({
+          storageDriver,
+          accessMode,
+          path: relativePath,
+          sourcePath: temporaryPath,
+          contentType: detected.mime,
+          move: storageDriver === "local",
+        });
+        storedNewMedia = {
+          storageDriver,
+          accessMode,
+          path: relativePath,
+          contentType: detected.mime,
+        };
 
         const imageId = ulid();
         const now = new Date().toISOString();
@@ -261,8 +363,9 @@ export function registerImageRoutes(
             .prepare(
               `INSERT INTO images
                 (id, sha256, original_name, original_mime, original_ext, original_path,
-                 width, height, size_bytes, has_alpha, is_animated, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 width, height, size_bytes, has_alpha, is_animated, status, storage_driver, access_mode,
+                 created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               imageId,
@@ -277,6 +380,8 @@ export function registerImageRoutes(
               metadata.hasAlpha ? 1 : 0,
               isAnimated ? 1 : 0,
               imageStatus,
+              storageDriver,
+              accessMode,
               now,
               now,
             );
@@ -314,10 +419,29 @@ export function registerImageRoutes(
         if (!image) throw new Error("Created image record not found");
         return reply.code(201).send({
           duplicate: false,
-          image: serializeImage(database, config, image),
+          image: serializeImage(database, storage, image),
         });
       } catch (error) {
-        if (movedNewFile && finalPath) await unlink(finalPath).catch(() => undefined);
+        if (storedNewMedia) {
+          const activeReference = database
+            .prepare("SELECT id FROM images WHERE original_path = ? AND deleted_at IS NULL LIMIT 1")
+            .get(storedNewMedia.path) as unknown as { id: string } | undefined;
+          if (!activeReference) await storage.delete(storedNewMedia);
+        }
+        if (computedSha256 && isUniqueConstraintError(error)) {
+          const duplicate = database
+            .prepare("SELECT id FROM images WHERE sha256 = ? AND deleted_at IS NULL")
+            .get(computedSha256) as unknown as { id: string } | undefined;
+          if (duplicate) {
+            const existingImage = getImage(database, duplicate.id);
+            if (existingImage) {
+              return reply.code(200).send({
+                duplicate: true,
+                image: serializeImage(database, storage, existingImage),
+              });
+            }
+          }
+        }
         throw error;
       } finally {
         await unlink(temporaryPath).catch(() => undefined);
@@ -332,11 +456,12 @@ export function registerImageRoutes(
       const images = database
         .prepare(
           `SELECT id, sha256, original_name, original_mime, original_path, width, height,
-                  size_bytes, has_alpha, is_animated, status, created_at, updated_at
+                  size_bytes, has_alpha, is_animated, status, storage_driver, access_mode,
+                  created_at, updated_at
            FROM images WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 100`,
         )
         .all() as unknown as ImageRow[];
-      return { items: images.map((image) => serializeImage(database, config, image)) };
+      return { items: images.map((image) => serializeImage(database, storage, image)) };
     },
   );
 
@@ -346,7 +471,7 @@ export function registerImageRoutes(
     async (request, reply) => {
       const image = getImage(database, request.params.id);
       if (!image) return reply.code(404).send({ status: "error", code: "IMAGE_NOT_FOUND" });
-      return { image: serializeImage(database, config, image) };
+      return { image: serializeImage(database, storage, image) };
     },
   );
 
@@ -390,13 +515,15 @@ export function registerImageRoutes(
       const variants = database
         .prepare("SELECT path FROM variants WHERE image_id = ?")
         .all(image.id) as unknown as Array<{ path: string }>;
-      const paths = [image.original_path, ...variants.map((variant) => variant.path)].map((path) =>
-        storedFilePath(directories.root, path),
-      );
+      const medias = [image.original_path, ...variants.map((variant) => variant.path)].map((path) => ({
+        storageDriver: image.storage_driver,
+        accessMode: image.access_mode,
+        path,
+      }));
       immediateTransaction(database, () => {
         database.prepare("DELETE FROM images WHERE id = ?").run(image.id);
       });
-      await Promise.all(paths.map((path) => unlink(path).catch(() => undefined)));
+      await Promise.all(medias.map((media) => storage.delete(media)));
       return reply.code(204).send();
     },
   );

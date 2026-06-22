@@ -95,6 +95,7 @@ export const api = {
 export function uploadImage(
   file: File,
   onProgress: (percentage: number) => void,
+  options: { storageDriver?: "local" | "s3"; accessMode?: "direct" | "proxy" } = {},
 ): Promise<{ duplicate: boolean; image: ImageItem }> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
@@ -118,6 +119,8 @@ export function uploadImage(
     });
     request.addEventListener("error", () => reject(new ApiError(0, "NETWORK_ERROR")));
     const form = new FormData();
+    if (options.storageDriver) form.append("storage", options.storageDriver);
+    if (options.accessMode) form.append("access", options.accessMode);
     form.append("file", file);
     request.send(form);
   });

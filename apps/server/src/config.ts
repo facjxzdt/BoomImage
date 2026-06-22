@@ -26,6 +26,24 @@ export interface AppConfig {
   avifQuality: number;
   avifEffort: number;
   webpQuality: number;
+  storageDriver: StorageDriver;
+  storageAccessMode: StorageAccessMode;
+  s3: S3Config;
+}
+
+export type StorageDriver = "local" | "s3";
+export type StorageAccessMode = "direct" | "proxy";
+
+export interface S3Config {
+  endpoint?: string;
+  region: string;
+  bucket: string;
+  prefix: string;
+  publicBaseUrl?: string;
+  forcePathStyle: boolean;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  sessionToken?: string;
 }
 
 function integerFromEnv(
@@ -65,6 +83,35 @@ function logLevelFromEnv(value: string | undefined): LogLevel {
   return level as LogLevel;
 }
 
+function storageDriverFromEnv(value: string | undefined): StorageDriver {
+  const driver = value ?? "local";
+  if (driver !== "local" && driver !== "s3") {
+    throw new Error("STORAGE_DRIVER must be one of: local, s3");
+  }
+  return driver;
+}
+
+function storageAccessModeFromEnv(value: string | undefined): StorageAccessMode {
+  const mode = value ?? "proxy";
+  if (mode !== "direct" && mode !== "proxy") {
+    throw new Error("S3_ACCESS_MODE must be one of: direct, proxy");
+  }
+  return mode;
+}
+
+function booleanFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  if (["1", "true", "yes", "on"].includes(raw.toLowerCase())) return true;
+  if (["0", "false", "no", "off"].includes(raw.toLowerCase())) return false;
+  throw new Error(`${name} must be a boolean`);
+}
+
+function normalizeS3Prefix(value: string | undefined): string {
+  if (!value) return "";
+  return value.replace(/^\/+|\/+$/g, "");
+}
+
 function findProjectRoot(start = process.cwd()): string {
   let current = resolve(start);
   const root = parse(current).root;
@@ -79,6 +126,30 @@ function findProjectRoot(start = process.cwd()): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const projectRoot = findProjectRoot();
   const dataDir = resolve(env.APP_DATA_DIR ?? resolve(projectRoot, "data"));
+  const storageDriver = storageDriverFromEnv(env.STORAGE_BACKEND ?? env.STORAGE_DRIVER);
+  const storageAccessMode = storageAccessModeFromEnv(
+    env.S3_ACCESS_MODE ?? env.STORAGE_ACCESS_MODE ?? env.S3_PUBLIC_ACCESS_MODE,
+  );
+  const s3: S3Config = {
+    region: env.S3_REGION ?? "auto",
+    bucket: env.S3_BUCKET ?? "",
+    prefix: normalizeS3Prefix(env.S3_PREFIX),
+    forcePathStyle: booleanFromEnv(env, "S3_FORCE_PATH_STYLE", false),
+  };
+  if (env.S3_ENDPOINT) s3.endpoint = env.S3_ENDPOINT;
+  if (env.S3_PUBLIC_BASE_URL) s3.publicBaseUrl = env.S3_PUBLIC_BASE_URL.replace(/\/$/, "");
+  const accessKeyId = env.S3_ACCESS_KEY_ID || env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = env.S3_SECRET_ACCESS_KEY || env.AWS_SECRET_ACCESS_KEY;
+  const sessionToken = env.S3_SESSION_TOKEN || env.AWS_SESSION_TOKEN;
+  if (accessKeyId) s3.accessKeyId = accessKeyId;
+  if (secretAccessKey) s3.secretAccessKey = secretAccessKey;
+  if (sessionToken) s3.sessionToken = sessionToken;
+  if (storageDriver === "s3" && !s3.bucket) {
+    throw new Error("S3_BUCKET is required when STORAGE_DRIVER=s3");
+  }
+  if ((s3.accessKeyId && !s3.secretAccessKey) || (!s3.accessKeyId && s3.secretAccessKey)) {
+    throw new Error("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be provided together");
+  }
 
   return {
     host: env.APP_HOST ?? "0.0.0.0",
@@ -115,5 +186,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     avifQuality: integerFromEnv(env, "AVIF_QUALITY", 50, 1, 100),
     avifEffort: integerFromEnv(env, "AVIF_EFFORT", 4, 0, 9),
     webpQuality: integerFromEnv(env, "WEBP_QUALITY", 82, 1, 100),
+    storageDriver,
+    storageAccessMode,
+    s3,
   };
 }

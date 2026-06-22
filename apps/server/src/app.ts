@@ -14,6 +14,7 @@ import {
 } from "./filesystem.js";
 import { registerImageRoutes } from "./images.js";
 import { registerSecurityHeaders } from "./security.js";
+import { createMediaStorage, type MediaStorage } from "./storage.js";
 import { ImageWorker } from "./worker.js";
 
 export interface BuildAppOptions {
@@ -21,11 +22,13 @@ export interface BuildAppOptions {
   logger?: boolean;
   startMaintenance?: boolean;
   startWorkers?: boolean;
+  storage?: MediaStorage;
 }
 
 export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
   const config = options.config ?? loadConfig();
   const directories = await prepareDataDirectories(config.dataDir);
+  const storage = options.storage ?? createMediaStorage(config, directories);
   const database = await openDatabase(config.databasePath, config.migrationsDir);
 
   const app = Fastify({
@@ -103,7 +106,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
 
   registerAuthRoutes(app, database, config);
-  registerImageRoutes(app, database, config, directories);
+  registerImageRoutes(app, database, config, directories, storage);
 
   let temporaryCleanupTimer: NodeJS.Timeout | undefined;
   const shouldStartMaintenance = options.startMaintenance ?? process.env.NODE_ENV !== "test";
@@ -138,7 +141,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   const shouldStartWorkers = options.startWorkers ?? process.env.NODE_ENV !== "test";
   const worker = shouldStartWorkers
-    ? new ImageWorker({ database, config, directories, logger: app.log })
+    ? new ImageWorker({ database, config, directories, storage, logger: app.log })
     : undefined;
   worker?.start();
 

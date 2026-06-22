@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, unlink } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import { buildApp } from "../src/app.js";
 import { loadConfig, type AppConfig } from "../src/config.js";
 import { openDatabase, type AppDatabase } from "../src/database.js";
 import { prepareDataDirectories, type DataDirectories } from "../src/filesystem.js";
+import { createMediaStorage, type MediaStorage, type StoredMedia, type StoreFileOptions } from "../src/storage.js";
 import { ImageWorker } from "../src/worker.js";
 
 const cleanupDirectories: string[] = [];
@@ -15,6 +16,39 @@ const logger = {
   info: () => undefined,
   error: () => undefined,
 };
+
+class MemoryMediaStorage implements MediaStorage {
+  readonly files = new Map<string, Buffer>();
+  constructor(readonly local: MediaStorage) {}
+
+  async storeFile(options: StoreFileOptions): Promise<void> {
+    if (options.storageDriver === "local") return this.local.storeFile(options);
+    this.files.set(`${options.storageDriver}:${options.path}`, await readFile(options.sourcePath));
+    if (options.move) await unlink(options.sourcePath).catch(() => undefined);
+  }
+
+  async materializeToLocal(media: StoredMedia, targetPath: string): Promise<void> {
+    if (media.storageDriver === "local") return this.local.materializeToLocal(media, targetPath);
+    const content = this.files.get(`${media.storageDriver}:${media.path}`);
+    if (!content) throw new Error("missing fake s3 media");
+    await writeFile(targetPath, content);
+  }
+
+  async delete(media: StoredMedia): Promise<void> {
+    if (media.storageDriver === "local") return this.local.delete(media);
+    this.files.delete(`${media.storageDriver}:${media.path}`);
+  }
+
+  publicUrl(media: StoredMedia): string {
+    return media.storageDriver === "s3"
+      ? `https://cdn.example.test/${media.path}`
+      : this.local.publicUrl(media);
+  }
+
+  async sendProxy(): Promise<void> {
+    throw new Error("not used");
+  }
+}
 
 afterEach(async () => {
   await Promise.all(cleanupDirectories.splice(0).map((path) => rm(path, { recursive: true })));
@@ -40,6 +74,7 @@ async function uploadedImageFixture(): Promise<{
   database: AppDatabase;
   directories: DataDirectories;
   imageId: string;
+  storage: MediaStorage;
 }> {
   const dataDir = await mkdtemp(join(tmpdir(), "boomimage-worker-test-"));
   cleanupDirectories.push(dataDir);
@@ -52,6 +87,8 @@ async function uploadedImageFixture(): Promise<{
     IMAGE_WORKERS: "1",
     LOG_LEVEL: "silent",
   });
+  const directories = await prepareDataDirectories(config.dataDir);
+  const storage = createMediaStorage(config, directories);
   const app = await buildApp({ config, logger: false, startWorkers: false });
   const setup = await app.inject({
     method: "POST",
@@ -89,8 +126,9 @@ async function uploadedImageFixture(): Promise<{
     app,
     config,
     database: await openDatabase(config.databasePath, config.migrationsDir),
-    directories: await prepareDataDirectories(config.dataDir),
+    directories,
     imageId: upload.json().image.id as string,
+    storage,
   };
 }
 
@@ -101,6 +139,7 @@ describe("image conversion worker", () => {
       database: fixture.database,
       config: fixture.config,
       directories: fixture.directories,
+      storage: fixture.storage,
       logger,
     });
 
@@ -156,6 +195,7 @@ describe("image conversion worker", () => {
       database: fixture.database,
       config: fixture.config,
       directories: fixture.directories,
+      storage: fixture.storage,
       logger,
     });
 
@@ -179,6 +219,41 @@ describe("image conversion worker", () => {
       expect(job.attempts).toBe(3);
       expect(job.last_error).not.toContain(fixture.config.dataDir);
       expect(image.status).toBe("failed");
+    } finally {
+      fixture.database.close();
+      await fixture.app.close();
+    }
+  });
+
+  it("materializes S3 originals and stores generated variants back to S3", async () => {
+    const fixture = await uploadedImageFixture();
+    const memoryStorage = new MemoryMediaStorage(fixture.storage);
+    const original = fixture.database
+      .prepare("SELECT original_path FROM images WHERE id = ?")
+      .get(fixture.imageId) as unknown as { original_path: string };
+    const originalBytes = await readFile(join(fixture.config.dataDir, ...original.original_path.split("/")));
+    memoryStorage.files.set(`s3:${original.original_path}`, originalBytes);
+    await unlink(join(fixture.config.dataDir, ...original.original_path.split("/")));
+    fixture.database
+      .prepare("UPDATE images SET storage_driver = 's3', access_mode = 'direct' WHERE id = ?")
+      .run(fixture.imageId);
+    const worker = new ImageWorker({
+      database: fixture.database,
+      config: fixture.config,
+      directories: fixture.directories,
+      storage: memoryStorage,
+      logger,
+    });
+
+    try {
+      expect(await worker.processNextJob("s3-worker")).toBe(true);
+      const variants = fixture.database
+        .prepare("SELECT path, status FROM variants WHERE image_id = ?")
+        .all(fixture.imageId) as unknown as Array<{ path: string; status: string }>;
+      expect(variants.every((variant) => variant.status === "ready")).toBe(true);
+      for (const variant of variants) {
+        expect(memoryStorage.files.get(`s3:${variant.path}`)?.byteLength).toBeGreaterThan(0);
+      }
     } finally {
       fixture.database.close();
       await fixture.app.close();
